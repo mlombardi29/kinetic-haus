@@ -278,6 +278,66 @@ function json(obj){
     .setMimeType(ContentService.MimeType.JSON);
 }
 
+/* ============================ DATA REPAIR ============================
+ * ONE-TIME cleanup for the July 2026 duplicate-row glitch.
+ * Run from the Apps Script editor: pick "runCleanupJuly2026" in the
+ * function dropdown (next to Debug), press Run. Safe to run twice.
+ *
+ * What it does:
+ *  1. Removes duplicate copies of the same set everywhere (keeps the
+ *     newest copy of each set).
+ *  2. Marks the July 4 "Chest & Arms" workout as completed.
+ *  3. Replaces the glitched July 22 workout with the real session
+ *     (as dictated by the owner on July 22, 2026).
+ *  4. Drops blank spacer rows.
+ * ==================================================================== */
+function runCleanupJuly2026(){
+  return withLock(function(){
+    const sh = getSheet(getSS(), SHEET_LOGS, LOG_HEADERS);
+    const last = sh.getLastRow();
+    if (last < 2) return 'Logs sheet is empty — nothing to clean.';
+    const data = sh.getRange(2,1,last-1,LOG_HEADERS.length).getValues();
+
+    // 1) de-duplicate: keep the LAST copy of each workout+exercise+set
+    const map = {}, order = [];
+    data.forEach(r => {
+      if (!String(r[0])) return;                       // skip blank rows
+      const key = [r[0], r[4], r[5], r[6]].join('|');  // workoutId|exercise|order|setNumber
+      if (!(key in map)) order.push(key);
+      map[key] = r.slice();
+    });
+    let rows = order.map(k => map[k]);
+
+    // 2) July 4 "Chest & Arms" was real training — mark it finished
+    rows.forEach(r => { if (r[0] === 'w_mr6dju07le4ci') r[3] = 'completed'; });
+
+    // 3) rebuild the July 22 session with the real sets
+    const JUL22 = 'w_mrwg9fm1opdg0';
+    const ts = rows.filter(r => r[0] === JUL22)
+                   .reduce((m,r) => Math.max(m, Number(r[13])||0), Date.now());
+    rows = rows.filter(r => r[0] !== JUL22);
+    const EX = [ // [exercise, order, reps, weight, note]
+      ['Chin-Ups',                 0,  6,  '', 'Wide grip'],
+      ['One-Arm Dumbbell Rows',    1, 12,  55, ''],
+      ['Reverse Flies',            2, 12,  70, ''],
+      ['Shoulder Press',           3, 12, 140, ''],
+      ['Lateral Raises',           4, 10,  40, ''],
+      ['Russian Twists',           5, 25,  '', ''],
+      ['Plank with Shoulder Taps', 6, 60,  '', ''],
+      ['Abdominal crunch',         7, 14, 200, ''],
+    ];
+    EX.forEach(e => { for (let s = 1; s <= 3; s++){
+      rows.push([JUL22, '2026-07-22', 'Back, Shoulders & Core', 'completed',
+        e[0], e[1], s, e[3]===''?'':e[3], e[2], 'lbs', true, e[4], '', ts, true]);
+    }});
+
+    // 4) rewrite the whole sheet body
+    sh.getRange(2,1,last-1,LOG_HEADERS.length).clearContent();
+    if (rows.length) sh.getRange(2,1,rows.length,LOG_HEADERS.length).setValues(rows);
+    return 'Cleanup done. Logs now has ' + rows.length + ' rows.';
+  });
+}
+
 /* Optional: run once from the editor to pre-create the sheets/headers. */
 function setup(){
   const ss = getSS();
