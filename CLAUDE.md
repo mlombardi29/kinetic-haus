@@ -53,6 +53,26 @@ copy is harmless but must never be used (it predates bug fixes).
 - The owner's desktop backup lives in a "Claude" folder; one subfolder per
   GitHub repository, synced manually via GitHub Desktop.
 
+## Key concepts in index.html (Aug 2026 rework)
+- **Work** (`workoutWork` / `setWork`) is the headline number everywhere the UI
+  used to show "volume". Weighted sets score weight×reps as before; bodyweight
+  reps score `bodyWeight × leverage` (see `BW_FACTORS`); timed holds score
+  seconds ÷ `SEC_PER_REP`. `workoutVolume` still exists and is still pure iron.
+  Body weight lives in Settings (`state.bodyWeight`, default `BW_DEFAULT` 180)
+  and rides the EXISTING Settings key/value sheet — no Code.gs change needed.
+- **Milestones** are ladders, not a fixed list. `ladder()` + `tierList()` grow a
+  new rung once you clear the top one, so a target always exists (this is what
+  replaced the dead-end Quarter-Million Club). `badgeCategories()` groups them
+  into the 5 `CAT_ORDER` categories and shows earned + the next two rungs only.
+- **Greyed-out numbers are records, not history.** `allTimeBest()` drives the set
+  placeholders and the per-exercise BEST strip; `dayBest()` drives the logger's
+  "VS BEST DAY" bar. Both EXCLUDE the workout you're in, so the target can't
+  drift mid-session. Both are memoised in `_bestCache` — call `clearBestCache()`
+  if you ever mutate `state.workouts` outside `queueSaveWorkout`/`applyCloud`.
+- **Nothing scrolls forever.** History groups into collapsible months
+  (`histListHtml`), Progress groups exercises by `muscleGroup()` and milestones
+  by category; all use the shared `sectionHead()` accordion.
+
 ## Hard-won gotchas — never reintroduce
 1. Google Sheets returns date cells as Date OBJECTS. Always normalize with
    `ymd()` on read; never `.localeCompare` a raw date.

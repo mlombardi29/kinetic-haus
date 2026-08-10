@@ -333,14 +333,93 @@ function exerciseBest(name, excludeId){
   });
   return { weight:mw, reps:mr };
 }
+/* ---------- ALL-TIME BEST for an exercise ----------------------------------
+   Powers the greyed-out numbers you see before you type: the target is the record
+   to beat, not merely what you did last time. The workout you're in is excluded so
+   the target can't drift upward underneath you mid-session. */
+/* Records are read once per set row while logging, so memoise them. The cache is
+   dropped whenever the workout list changes (see queueSaveWorkout / render). */
+let _bestCache={};
+function clearBestCache(){ _bestCache={}; }
+function allTimeBest(name, excludeId){
+  const ck=(name||'').toLowerCase()+'||'+(excludeId||'');
+  if(_bestCache[ck]) return _bestCache[ck];
+  return (_bestCache[ck]=allTimeBest_(name, excludeId));
+}
+function allTimeBest_(name, excludeId){
+  const k=(name||'').toLowerCase();
+  const out={ weight:0, reps:0, hold:0, sessionReps:0, sessionWork:0, work:0, date:'', sessions:0 };
+  state.workouts.filter(w=>w.status==='completed' && w.workoutId!==excludeId).forEach(w=>{
+    (w.exercises||[]).forEach(e=>{
+      if((e.name||'').toLowerCase()!==k) return;
+      const t=effectiveType(e);
+      let sr=0, sw=0, any=false;
+      e.sets.forEach(s=>{
+        if(!s.completed) return;
+        any=true;
+        const wt=num(s.weight), rp=num(s.reps);
+        if(wt>out.weight){ out.weight=wt; out.date=w.date; }
+        if(t==='timed'){ if(rp>out.hold) out.hold=rp; }
+        else { if(rp>out.reps) out.reps=rp; sr+=rp; }
+        sw+=setWork(e.name,t,s);
+      });
+      if(any) out.sessions++;
+      if(sr>out.sessionReps) out.sessionReps=sr;
+      if(sw>out.sessionWork) out.sessionWork=sw;
+      out.work+=sw;
+    });
+  });
+  return out;
+}
+/* ---------- BEST DAY: the bar to clear for this whole workout ---------------
+   Matched on the workout name, so "Back, Shoulders & Core" is graded against every
+   previous "Back, Shoulders & Core" — the same idea as the per-exercise record but
+   for the session as a whole. */
+function dayBest(name, excludeId){
+  const ck='day||'+(name||'').trim().toLowerCase()+'||'+(excludeId||'');
+  if(_bestCache[ck]) return _bestCache[ck];
+  return (_bestCache[ck]=dayBest_(name, excludeId));
+}
+function dayBest_(name, excludeId){
+  const k=(name||'').trim().toLowerCase();
+  const out={ work:0, reps:0, hold:0, sets:0, volume:0, date:'', count:0, lastWork:0, lastDate:'' };
+  if(!k) return out;
+  const prior=state.workouts
+    .filter(w=>w.status==='completed' && w.workoutId!==excludeId && (w.name||'').trim().toLowerCase()===k)
+    .sort((a,b)=>(b.date||'').localeCompare(a.date||''));
+  prior.forEach(w=>{
+    out.count++;
+    const wk=workoutWork(w);
+    if(wk>out.work){ out.work=wk; out.date=w.date; }
+    out.reps=Math.max(out.reps, workoutReps(w));
+    out.hold=Math.max(out.hold, workoutHold(w));
+    out.sets=Math.max(out.sets, workoutSetsDone(w));
+    out.volume=Math.max(out.volume, workoutVolume(w));
+  });
+  if(prior.length){ out.lastWork=workoutWork(prior[0]); out.lastDate=prior[0].date; }
+  return out;
+}
 function fmtSetHint(type,w,r){
   if(type==='timed') return (num(r)||0)+'s';
   if(type==='bodyweight') return (num(r)||0)+' reps';
   return (num(w)||0)+' '+state.unit+' × '+(num(r)||0);
 }
+/* One-line "record to beat" for an exercise, in that exercise's own language. */
+function bestHint(name, type, excludeId){
+  const b=allTimeBest(name, excludeId);
+  if(type==='timed') return b.hold>0 ? b.hold+'s hold' : '';
+  if(type==='bodyweight'){
+    if(!b.reps) return '';
+    return b.reps+' reps' + (b.sessionReps>b.reps ? ' · '+b.sessionReps+' in a session' : '');
+  }
+  if(!b.weight && !b.reps) return '';
+  return Math.round(b.weight)+' '+state.unit+' × '+b.reps+' reps';
+}
 function collapsedHint(e,type){
   let s=null; e.sets.forEach(x=>{ if(num(x.weight)>0||num(x.reps)>0){ if(!s||num(x.weight)>num(s.weight)||(num(x.weight)===num(s.weight)&&num(x.reps)>num(s.reps))) s=x; } });
   if(s) return fmtSetHint(type, s.weight, s.reps);
+  const bh=bestHint(e.name, type, state.active&&state.active.workoutId);
+  if(bh) return 'best '+bh;
   const lu=lastUsed(e.name); if(lu) return 'last '+fmtSetHint(type, lu.weight, lu.reps);
   return '';
 }
@@ -433,10 +512,11 @@ const Store = (() => {
 })();
 
 /* ---------- global state ---------- */
-const KEY = { url:'kh_api_url', cache:'kh_cache', unit:'kh_unit', custom:'kh_custom_ex', seeded:'kh_seeded', tp:'kh_typeprefs' };
+const KEY = { url:'kh_api_url', cache:'kh_cache', unit:'kh_unit', custom:'kh_custom_ex', seeded:'kh_seeded', tp:'kh_typeprefs', bw:'kh_bodyweight' };
 const state = {
   apiUrl: Store.get(KEY.url) || '',
   unit:   Store.get(KEY.unit) || 'lbs',
+  bodyWeight: Store.get(KEY.bw) || '',   // powers work-scoring for bodyweight movements
   days:   {},        // name -> { name, exercises:[{name,sets,order}] }
   workouts: [],      // [{workoutId,date,name,status,notes,exercises:[{name,order,notes,sets:[{setNumber,weight,reps,unit,completed}]}], ...}]
   active: null,      // workout currently open in the logger/editor
@@ -462,10 +542,100 @@ const fmtDateShort = iso => { const d=new Date(iso+'T00:00:00'); if(isNaN(d)) re
   return d.toLocaleDateString(undefined,{month:'short',day:'numeric',year:'2-digit'}); };
 const num = v => { const n=parseFloat(v); return isNaN(n)?0:n; };
 
+/* ---------- WORK: the one number every exercise can earn ---------------------
+   Weight × reps only ever rewarded barbells and dumbbells, so push-ups, chin-ups,
+   planks and crunches scored a flat zero — they never moved the lifetime total or
+   the per-exercise charts. "Work" fixes that: a bodyweight rep counts the share of
+   your body weight that movement actually lifts, and a timed hold counts seconds.
+     • weighted   → weight × reps                    (unchanged, real iron)
+     • bodyweight → (bodyWeight × leverage + added) × reps
+     • timed      → bodyWeight × leverage × seconds / SEC_PER_REP
+   Everything is expressed in your unit (lbs by default) so one number ranks a
+   push-up day against a bench day. */
+const BW_DEFAULT = 180;      // used until you set your body weight in Settings
+const SEC_PER_REP = 4;       // 4 seconds of a hold ≈ one rep of work
+
+/* Share of body weight each movement actually lifts. More specific patterns
+   MUST come first — the first match wins. */
+const BW_FACTORS = [
+  [/muscle-?up/, 1.15],
+  [/weighted (pull|chin)/, 1.00],
+  [/pull-?up|chin-?up/, 1.00],
+  [/\bdips?\b|dragon flag/, 1.00],
+  [/pistol|sissy squat|nordic/, 0.85],
+  [/knee push-?up|incline push-?up/, 0.50],
+  [/diamond push-?up|decline push-?up|plyometric push-?up|wide push-?up/, 0.70],
+  [/push-?up/, 0.64],
+  [/burpee|devil press|man maker/, 0.75],
+  [/inverted row|bear crawl/, 0.60],
+  [/lunge|step-?up|split squat|box step/, 0.65],
+  [/squat|wall sit|good morning/, 0.65],
+  [/box jump|jump squat|skater|jumping jack|high knee|mountain climb|jump rope|ab wheel/, 0.45],
+  [/glute bridge|hip thrust|back extension|superman/, 0.45],
+  [/leg raise|knee raise|v-?up|toe touch|flutter|hanging/, 0.40],
+  [/sit-?up|crunch|russian twist|bicycle|hollow|sit-up throw/, 0.35],
+  [/plank|dead bug|bird dog|side plank/, 0.30],
+  [/stretch|pose|foam roll|cat-cow|downward dog|thread the needle/, 0.10],
+];
+function bodyWeight(){ const n=num(state.bodyWeight); return n>0 ? n : BW_DEFAULT; }
+function bwFactor(name){
+  const n=(name||'').toLowerCase();
+  for(const [rx,f] of BW_FACTORS){ if(rx.test(n)) return f; }
+  return 0.50;                                   // sensible middle for anything unknown
+}
+/* Work earned by ONE completed set. */
+function setWork(exName, type, s){
+  const wt=num(s.weight), rp=num(s.reps);
+  if(type==='weighted') return wt*rp;
+  const bw = bodyWeight()*bwFactor(exName);
+  if(type==='timed') return bw*rp/SEC_PER_REP;   // the reps field holds seconds
+  return (bw+wt)*rp;                             // reps-only (a weighted vest still counts)
+}
+function exerciseWork(e){
+  const t=effectiveType(e); let v=0;
+  (e.sets||[]).forEach(s=>{ if(s.completed) v+=setWork(e.name,t,s); });
+  return v;
+}
+function workoutWork(w){ let v=0; (w.exercises||[]).forEach(e=>v+=exerciseWork(e)); return v; }
+/* Pure iron moved — kept honest and separate, shown alongside work. */
 function workoutVolume(w){ let v=0; (w.exercises||[]).forEach(e=>e.sets.forEach(s=>{ if(s.completed) v+=num(s.weight)*num(s.reps); })); return v; }
+/* Reps (non-timed) and seconds held (timed) across a whole workout. */
+function workoutReps(w){ let c=0; (w.exercises||[]).forEach(e=>{ if(effectiveType(e)==='timed') return;
+  e.sets.forEach(s=>{ if(s.completed) c+=num(s.reps); }); }); return c; }
+function workoutHold(w){ let c=0; (w.exercises||[]).forEach(e=>{ if(effectiveType(e)!=='timed') return;
+  e.sets.forEach(s=>{ if(s.completed) c+=num(s.reps); }); }); return c; }
 function workoutSetsDone(w){ let c=0; (w.exercises||[]).forEach(e=>e.sets.forEach(s=>{ if(s.completed) c++; })); return c; }
 function workoutSetsTotal(w){ let c=0; (w.exercises||[]).forEach(e=>c+=e.sets.length); return c; }
-const fmtVol = v => v>=1000 ? (v/1000).toFixed(1).replace(/\.0$/,'')+'k' : Math.round(v).toString();
+const fmtVol = v => v>=1e6 ? (v/1e6).toFixed(v>=1e7?0:1).replace(/\.0$/,'')+'M'
+                  : v>=1000 ? (v/1000).toFixed(v>=1e5?0:1).replace(/\.0$/,'')+'k'
+                  : Math.round(v).toString();
+const fmtInt = n => Math.round(n).toLocaleString();
+function fmtDur(sec){
+  sec=Math.round(sec);
+  if(sec<60) return sec+'s';
+  if(sec<3600) return Math.round(sec/60)+'m';
+  const h=sec/3600;
+  return (h>=10?Math.round(h):h.toFixed(1).replace(/\.0$/,''))+'h';
+}
+
+/* ---------- muscle grouping (used to categorise the exercise lists) ---------- */
+function muscleGroup(name){
+  const n=(name||'').toLowerCase();
+  // core work first: "Plank with Shoulder Taps" is not a shoulder exercise
+  if(/plank|hollow|dead bug|bird dog|russian|crunch|sit-?up|v-?up|flutter|toe touch|dragon flag|ab wheel|woodchopper|pallof/.test(n)) return 'Core';
+  if(/reverse fl|rear delt|face pull/.test(n)) return 'Shoulders';
+  if(/bench|chest|pec|push-?up|svend/.test(n)) return 'Chest';
+  if(/\bfly\b|flies/.test(n)) return 'Chest';
+  if(/pull-?up|chin-?up|pulldown|\blat\b|\brows?\b|deadlift|shrug|back extension|good morning|superman|straight-arm/.test(n)) return 'Back';
+  if(/shoulder|overhead press|arnold|lateral raise|front raise|upright row|push press|push jerk|delt|landmine press|snatch|clean|jerk|thruster/.test(n)) return 'Shoulders';
+  if(/squat|lunge|leg press|leg extension|leg curl|step-?up|wall sit|calf|glute|hip thrust|hip abduction|hip adduction|nordic|kettlebell swing|pull-through|split squat/.test(n)) return 'Legs';
+  if(/curl|bicep|tricep|skull|pushdown|\bdips?\b|jm press|kickback/.test(n)) return 'Arms';
+  if(/plank|crunch|sit-?up|abdominal|\bab\b|leg raise|knee raise|russian|hollow|dead bug|bird dog|woodchopper|pallof|v-?up|toe touch|flutter|dragon flag|oblique|core/.test(n)) return 'Core';
+  if(/\brun\b|running|sprint|walk|erg|cycl|\bbike\b|elliptical|stair|swim|jump rope|burpee|box jump|jumping jack|high knee|battle rope|sled|bear crawl|carry|mountain climb|skater|tire flip|sledgehammer|wall ball|medicine ball/.test(n)) return 'Conditioning';
+  if(/stretch|pose|foam roll|cat-cow|thread the needle|downward dog/.test(n)) return 'Mobility';
+  return 'Other';
+}
+const MUSCLE_ORDER = ['Chest','Back','Shoulders','Arms','Legs','Core','Conditioning','Mobility','Other'];
 
 /* ---------- API layer ----------------------------------------------------
    Works in TWO modes automatically:
@@ -533,6 +703,9 @@ function queueSaveWorkout(w){
   // optimistic local update
   const i = state.workouts.findIndex(x=>x.workoutId===w.workoutId);
   if(i>=0) state.workouts[i]=w; else state.workouts.unshift(w);
+  // Records exclude the workout you're in, so mid-session edits can't change them —
+  // only a new row or a finished workout invalidates the memoised bests.
+  if(i<0 || w.status==='completed') clearBestCache();
   cacheSave();
   saveQueue.add(w.workoutId);
   setSaveFlag('saving');
@@ -650,7 +823,7 @@ function pushAllWorkouts(){
    have and re-push it, so toggling units / re-syncing can never wipe your days. */
 function applyCloud(data, pullUnit=true){
   if(!data || !data.ok) return;
-  state.online=true;
+  state.online=true; clearBestCache();
   const cDays=data.days||{}, cW=data.workouts||[];
   if(Object.keys(cDays).length){ state.days=cDays; }
   else if(Object.keys(state.days).length){ pushAllDays(); }   // cloud empty, we have local -> restore upward
@@ -658,6 +831,7 @@ function applyCloud(data, pullUnit=true){
   else if(state.workouts.length){ pushAllWorkouts(); }        // cloud empty, we have local -> restore upward
   if(pullUnit && data.settings && data.settings.unit){ state.unit=data.settings.unit; Store.set(KEY.unit,state.unit); }
   if(data.settings && data.settings.typePrefs){ try{ state.typePrefs=JSON.parse(data.settings.typePrefs)||{}; Store.set(KEY.tp,JSON.stringify(state.typePrefs)); }catch(e){} }
+  if(data.settings && num(data.settings.bodyWeight)>0){ state.bodyWeight=String(num(data.settings.bodyWeight)); Store.set(KEY.bw,state.bodyWeight); }
   cacheSave();
 }
 function sortWorkouts(a,b){
@@ -705,6 +879,7 @@ function bindDelegation(){
     if(act==='startDay')      startFromDay(val);
     else if(act==='editDay')  openDayEditor(val);
     else if(act==='openEx')   openExercise(val);
+    else if(act==='histDay')  setHistDay(val);
   });
 }
 function go(view){ state.view=view; render(); window.scrollTo({top:0,behavior:'instant'}); }
@@ -729,6 +904,7 @@ function openLogTab(){
    ================================================================= */
 function render(){
   const app=$('#app');
+  clearBestCache();
   let html='';
   // Connection guard: if we're cloud-backed but have nothing loaded yet, show a
   // clear reconnect state instead of a misleading "empty" home.
@@ -855,7 +1031,7 @@ function resumeCard(w){
     <div class="card p-5 relative overflow-hidden edge-ring">
       <div class="flex items-center gap-2 text-xs font-bold tracking-widest text-white"><span class="w-2 h-2 rounded-full pulse-dot bg-white"></span> IN PROGRESS</div>
       <h3 class="font-display font-700 text-2xl mt-2">${esc(w.name)}</h3>
-      <p class="text-mute text-sm mt-1">${workoutSetsDone(w)}/${workoutSetsTotal(w)} sets · ${fmtVol(workoutVolume(w))} ${state.unit} volume</p>
+      <p class="text-mute text-sm mt-1">${workoutSetsDone(w)}/${workoutSetsTotal(w)} sets · ${fmtVol(workoutWork(w))} ${state.unit} work</p>
       <button onclick="resumeWorkout('${w.workoutId}')" class="btn-press mt-4 w-full rounded-xl py-4 font-display font-700 text-lg tracking-wide text-ink" style="background:var(--volt)">RESUME</button>
     </div>
   </div>`;
@@ -884,7 +1060,7 @@ function recentCard(w){
     <div class="flex gap-4 mt-3 text-sm">
       <div><span class="font-display font-700 text-base">${(w.exercises||[]).length}</span> <span class="text-mute text-xs">exercises</span></div>
       <div><span class="font-display font-700 text-base">${workoutSetsDone(w)}</span> <span class="text-mute text-xs">sets</span></div>
-      <div><span class="font-display font-700 text-base accent-text">${fmtVol(workoutVolume(w))}</span> <span class="text-mute text-xs">${state.unit}</span></div>
+      <div><span class="font-display font-700 text-base accent-text">${fmtVol(workoutWork(w))}</span> <span class="text-mute text-xs">${state.unit}</span></div>
     </div>
   </div>`;
 }
@@ -942,7 +1118,7 @@ function viewLogger(){
       <span class="text-line">|</span>
       <span class="text-mute"><b id="statSets" class="text-white font-display">${workoutSetsDone(w)}</b>/${workoutSetsTotal(w)} sets</span>
       <span class="text-line">|</span>
-      <span class="text-mute"><b id="statVol" class="accent-text font-display">${fmtVol(workoutVolume(w))}</b> ${state.unit}</span>
+      <span class="text-mute"><b id="statVol" class="accent-text font-display">${fmtVol(workoutWork(w))}</b> ${state.unit}</span>
     </div>
     <div class="mt-2 flex items-center gap-2">
       <div class="flex-1 h-1.5 rounded-full bg-line overflow-hidden">
@@ -950,6 +1126,7 @@ function viewLogger(){
       </div>
       <span id="woPct" class="text-[11px] font-bold text-mute tabular-nums w-9 text-right">${workoutSetsTotal(w)?Math.round(100*workoutSetsDone(w)/workoutSetsTotal(w)):0}%</span>
     </div>
+    <div id="dayCmp" class="mt-2">${dayCmpHtml(w)}</div>
     ${ done ? `<div class="mt-2 text-center text-[11px] font-bold tracking-widest text-mute">EDITING COMPLETED WORKOUT</div>`:'' }
   </div>
 
@@ -984,6 +1161,25 @@ function viewLogger(){
   `;
 }
 
+/* Greyed-out benchmark for the WHOLE session: today's work against the best you
+   have ever done on this same day. Reps ride along so a pure-bodyweight day still
+   has something concrete to chase. */
+function dayCmpHtml(w){
+  const b=dayBest(w.name, w.workoutId);
+  const work=workoutWork(w), reps=workoutReps(w), hold=workoutHold(w);
+  if(!b.count){
+    return `<div class="text-[10px] text-mute text-center">First <b class="text-white">${esc(w.name)}</b> — today sets the benchmark.</div>`;
+  }
+  const pct=b.work>0 ? Math.min(100, Math.round(100*work/b.work)) : 0;
+  const beat=b.work>0 && work>b.work;
+  const repPart = b.reps>0 ? ` · <b class="${reps>b.reps?'text-white':''}">${fmtInt(reps)}</b>/${fmtInt(b.reps)} reps` : '';
+  const holdPart = b.hold>0 ? ` · <b class="${hold>b.hold?'text-white':''}">${fmtDur(hold)}</b>/${fmtDur(b.hold)}` : '';
+  return `<div class="flex items-center justify-between text-[10px] font-semibold gap-2">
+      <span class="${beat?'edge-text font-bold tracking-widest':'text-mute tracking-widest'} shrink-0">${beat?'NEW BEST DAY':'VS BEST DAY'}</span>
+      <span class="text-mute truncate text-right"><b class="text-white font-display">${fmtVol(work)}</b>/${fmtVol(b.work)} ${state.unit}${repPart}${holdPart}</span>
+    </div>
+    <div class="h-1 rounded-full bg-line overflow-hidden mt-1"><div class="h-full ${beat?'bg-white':'bg-white/45'} transition-all duration-300" style="width:${beat?100:pct}%"></div></div>`;
+}
 function exerciseCard(e,i){
   const type=effectiveType(e);
   const done=e.sets.filter(s=>s.completed).length, tot=e.sets.length;
@@ -1021,7 +1217,7 @@ function exerciseCard(e,i){
         <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>
       </button>
     </div>
-
+    <div id="exBest-${i}">${ exBestBar(e,i,type) }</div>
     <div class="grid ${cols} gap-2 mt-2 px-1 text-[9px] font-bold tracking-widest text-mute">${head}</div>
     <div class="space-y-1.5 mt-1" data-sets="${i}">
       ${ e.sets.map((s,j)=>setRow(i,j,s,type)).join('') }
@@ -1034,11 +1230,42 @@ function exerciseCard(e,i){
     ${ e.notes ? `<p class="text-xs text-mute mt-1.5 italic px-1">“${esc(e.notes)}”</p>`:'' }
   </div>`;
 }
+/* "Record to beat" strip under an exercise's name while logging.
+   Weighted movements get their PB in words; reps-only and timed movements also get
+   a bar tracking THIS session's total against your best-ever session — that is the
+   scoreboard bodyweight work never had. */
+function exBestBar(e,i,type){
+  const excl = state.active && state.active.workoutId;
+  const b = allTimeBest(e.name, excl);
+  const pb = bestHint(e.name, type, excl);
+  if(!pb && !b.sessionReps) return '';
+  const isRep = type!=='weighted';
+  let bar='';
+  if(isRep && b.sessionReps>0){
+    let cur=0; e.sets.forEach(s=>{ if(s.completed) cur+=num(s.reps); });
+    const pct=Math.min(100, Math.round(100*cur/b.sessionReps));
+    const beat=cur>b.sessionReps;
+    const label = type==='timed' ? fmtDur(cur)+' / '+fmtDur(b.sessionReps) : cur+' / '+b.sessionReps+' reps';
+    bar = `<div class="mt-1.5">
+      <div class="flex items-center justify-between text-[10px] font-semibold">
+        <span class="text-mute">SESSION BEST</span>
+        <span class="${beat?'edge-text font-bold':'text-mute'}">${beat?'BEAT IT · ':''}${esc(label)}</span>
+      </div>
+      <div class="h-1 rounded-full bg-line overflow-hidden mt-1"><div class="h-full ${beat?'bg-white':'bg-white/45'}" style="width:${pct}%"></div></div>
+    </div>`;
+  }
+  return `${ pb ? `<div class="text-[10px] text-mute mt-1 px-0.5 truncate"><span class="font-bold tracking-widest">BEST</span> ${esc(pb)}${b.date?' · '+esc(fmtDateShort(b.date)):''}</div>` : '' }${bar}`;
+}
 function setRow(i,j,s,type){
-  type = type || effectiveType(state.active.exercises[i]);
-  const lu = lastUsed(state.active.exercises[i].name);
-  const wph = lu && num(lu.weight)>0 ? String(num(lu.weight)) : '0';
-  const rph = lu && num(lu.reps)>0 ? String(num(lu.reps)) : '0';
+  const ex = state.active.exercises[i];
+  type = type || effectiveType(ex);
+  // Greyed placeholders = your ALL-TIME BEST for this movement (the record to beat),
+  // falling back to the last session's numbers until a record exists.
+  const b  = allTimeBest(ex.name, state.active.workoutId);
+  const lu = lastUsed(ex.name);
+  const bestR = type==='timed' ? b.hold : b.reps;
+  const wph = b.weight>0 ? String(Math.round(b.weight)) : (lu && num(lu.weight)>0 ? String(num(lu.weight)) : '0');
+  const rph = bestR>0     ? String(Math.round(bestR))   : (lu && num(lu.reps)>0   ? String(num(lu.reps))   : '0');
   const setno=`<div class="text-center font-display font-700 text-sm text-mute">${j+1}</div>`;
   const check=`<button onclick="toggleSet(${i},${j})" class="mx-auto w-8 h-8 rounded-lg btn-press flex items-center justify-center ${s.completed?'':'chip'}" style="${s.completed?'background:var(--volt)':''}">
       <svg class="w-5 h-5 ${s.completed?'text-ink':'text-mute'}" fill="none" stroke="currentColor" stroke-width="3" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m5 13 4 4L19 7"/></svg>
@@ -1073,13 +1300,18 @@ function refreshStats(){
   const w=state.active; if(!w) return;
   const setsBox=$('#statSets')?.parentElement;   // the "<b>done</b>/total sets" span
   if(setsBox) setsBox.innerHTML = `<b id="statSets" class="text-white font-display">${workoutSetsDone(w)}</b>/${workoutSetsTotal(w)} sets`;
-  const vol=$('#statVol'); if(vol) vol.textContent=fmtVol(workoutVolume(w));
+  const vol=$('#statVol'); if(vol) vol.textContent=fmtVol(workoutWork(w));
   const tot=workoutSetsTotal(w), pct=tot?Math.round(100*workoutSetsDone(w)/tot):0;
   const bar=$('#woProgress'); if(bar) bar.style.width=pct+'%';
   const pl=$('#woPct'); if(pl) pl.textContent=pct+'%';
+  const cmp=$('#dayCmp'); if(cmp) cmp.innerHTML=dayCmpHtml(w);
 }
 function onSet(i,j,field,val){
-  const w=state.active; w.exercises[i].sets[j][field]=val; refreshStats(); touch();
+  const w=state.active; w.exercises[i].sets[j][field]=val; refreshExBest(i); refreshStats(); touch();
+}
+function refreshExBest(i){
+  const w=state.active; if(!w||!w.exercises[i]) return;
+  const box=$(`#exBest-${i}`); if(box) box.innerHTML = exBestBar(w.exercises[i], i, effectiveType(w.exercises[i]));
 }
 function toggleSet(i,j){
   const w=state.active; const e=w.exercises[i]; const s=e.sets[j];
@@ -1091,7 +1323,7 @@ function toggleSet(i,j){
     if(navigator.vibrate) navigator.vibrate(8);
     checkPR(i,j,type);
   }
-  refreshSets(i); refreshStats(); touch();
+  refreshSets(i); refreshExBest(i); refreshStats(); touch();
 }
 function checkPR(i,j,type){
   const w=state.active; const e=w.exercises[i]; const s=e.sets[j];
@@ -1267,17 +1499,47 @@ function finishWorkout(){
   if(!any){ confirm2('Nothing completed','Mark at least one set complete, or finish anyway?','Finish anyway',()=>doFinish()); return; }
   doFinish();
 }
+/* Records that only a whole session can break: total reps on a bodyweight
+   movement, total time on a hold, and the work total for the day itself.
+   Must run BEFORE the workout is marked complete so it isn't compared to itself. */
+function sessionPRCelebs(w){
+  const out=[], excl=w.workoutId;
+  (w.exercises||[]).forEach(e=>{
+    const type=effectiveType(e);
+    if(type==='weighted') return;                       // already covered set-by-set
+    const b=allTimeBest(e.name, excl);
+    let cur=0; e.sets.forEach(s=>{ if(s.completed) cur+=num(s.reps); });
+    if(cur>0 && b.sessionReps>0 && cur>b.sessionReps){
+      out.push({ icon:'trophy', kind:'SESSION RECORD', title:e.name,
+        desc: type==='timed' ? `${fmtDur(cur)} held — most ever in one workout`
+                             : `${cur} reps — most ever in one workout` });
+    }
+  });
+  const db=dayBest(w.name, excl), work=workoutWork(w);
+  if(db.count && db.work>0 && work>db.work){
+    out.push({ icon:'mountain', kind:'BEST DAY EVER', title:w.name,
+      desc:`${fmtVol(work)} ${state.unit} of work — beats ${fmtVol(db.work)}` });
+  }
+  return out;
+}
 function doFinish(){
   const w=state.active;
   const beforeIds=computeBadges().filter(b=>b.earned).map(b=>b.id);  // before this one counts
+  const prs=sessionPRCelebs(w);                                      // measured before it counts too
   w.status='completed'; w.updatedAt=Date.now();
   queueSaveWorkout(w); flushSaves();
   state.workouts.sort(sortWorkouts);
   const fresh=computeBadges().filter(b=>b.earned && !beforeIds.includes(b.id));
   state.active=null; closeModal();
   go('home');
-  if(fresh.length) fresh.forEach(b=>enqueueCeleb({ icon:b.icon, kind:'ACHIEVEMENT UNLOCKED', title:b.name, desc:b.desc }));
-  else toast('Workout complete 🔥');
+  // queue AFTER the view swap — go() would otherwise tear down the first popup.
+  // Records come first, then milestones; a huge session is capped at 5 popups so
+  // finishing never turns into a tapping exercise.
+  const queue=prs.concat(fresh.map(b=>({ icon:b.icon, kind:'MILESTONE UNLOCKED', title:b.name, desc:b.desc })));
+  if(!queue.length){ toast('Workout complete 🔥'); return; }
+  const extra=queue.length-5;
+  queue.slice(0,5).forEach(c=>enqueueCeleb(c));
+  if(extra>0) setTimeout(()=>toast('+'+extra+' more unlocked — see Progress'), 400);
 }
 function discardWorkout(){
   const w=state.active; if(!w) return;
@@ -1430,12 +1692,54 @@ openDayEditor=function(name){ _origOpen(name); if(name){ _dayDraft._origName=nam
 /* =================================================================
    HISTORY
    ================================================================= */
-let _histQ='';
+/* History is grouped into collapsible months and filterable by day type, so it is
+   a browsable archive rather than one endless scroll back to your first workout. */
+let _histQ='', _histDay='', _openMonth={};
+function toggleMonth(k){ _openMonth[k]=!_openMonth[k]; updateHistoryList(); }
+function setHistDay(n){ _histDay=(n===_histDay?'':n); render(); }
+function monthLabel(key){
+  const d=new Date(key+'-01T00:00:00');
+  return isNaN(d) ? key : d.toLocaleDateString(undefined,{month:'long',year:'numeric'});
+}
+function histFiltered(){
+  const q=_histQ.trim().toLowerCase();
+  return state.workouts.filter(w=>{
+    if(w.status!=='completed' && w.status!=='in_progress') return false;
+    if(_histDay && (w.name||'').trim().toLowerCase()!==_histDay) return false;
+    if(!q) return true;
+    return (w.name||'').toLowerCase().includes(q)
+        || (w.exercises||[]).some(e=>e.name.toLowerCase().includes(q))
+        || (w.date||'').includes(q);
+  });
+}
+function histListHtml(){
+  const list=histFiltered();
+  if(!list.length) return `<div class="card p-6 text-center text-mute text-sm">No workouts found.</div>`;
+  const searching=!!_histQ.trim();
+  const months={}, order=[];
+  list.forEach(w=>{
+    const k=(w.date||'').slice(0,7) || 'undated';
+    if(!months[k]){ months[k]=[]; order.push(k); }
+    months[k].push(w);
+  });
+  order.sort((a,b)=>b.localeCompare(a));
+  return order.map((k,idx)=>{
+    const ws=months[k];
+    // newest month open by default; a live search opens everything it matched
+    const open = _openMonth[k] !== undefined ? _openMonth[k] : (searching || idx===0);
+    const work=ws.reduce((a,w)=>a+workoutWork(w),0);
+    return `<div class="card overflow-hidden">
+      ${ sectionHead(open, monthLabel(k), `${ws.length} · ${fmtVol(work)} ${state.unit}`, `toggleMonth('${esc(k)}')`) }
+      ${ open ? `<div class="px-3 pb-3 space-y-2">${ ws.map(historyCard).join('') }</div>` : '' }
+    </div>`;
+  }).join('');
+}
 function viewHistory(){
-  const all=state.workouts.filter(w=>w.status==='completed' || w.status==='in_progress');
-  const q=_histQ.toLowerCase();
-  const list=all.filter(w=> !q || w.name.toLowerCase().includes(q) ||
-    w.exercises.some(e=>e.name.toLowerCase().includes(q)) || (w.date||'').includes(q));
+  const names={};
+  state.workouts.forEach(w=>{ const n=(w.name||'').trim(); if(n) names[n]=(names[n]||0)+1; });
+  const chips=Object.keys(names).sort((a,b)=>names[b]-names[a]).slice(0,8);
+  // day names are free text (they can contain apostrophes) -> data-* + delegation, never inline JS
+  const chip=(label,val,on)=>`<button data-act="histDay" data-val="${esc(val)}" class="shrink-0 px-3 py-1.5 rounded-full text-xs font-bold btn-press ${on?'bg-white text-ink':'chip text-mute'}">${esc(label)}</button>`;
   return `
   ${brandBar()}
   <div class="px-5 mt-4">
@@ -1445,30 +1749,32 @@ function viewHistory(){
       <input value="${esc(_histQ)}" oninput="_histQ=this.value;updateHistoryList()" placeholder="Search workouts or exercises" class="bg-transparent py-3 w-full outline-none text-base placeholder:text-mute"/>
     </div>
   </div>
-  <div id="histList" class="px-5 mt-4 space-y-3">
-    ${ list.length ? list.map(historyCard).join('') : `<div class="card p-6 text-center text-mute text-sm">No workouts found.</div>` }
-  </div>`;
+  ${ chips.length>1 ? `<div class="mt-3 px-5 flex gap-2 overflow-x-auto pb-1">
+      ${chip('All','',!_histDay)}
+      ${chips.map(n=>chip(n,n.toLowerCase(),_histDay===n.toLowerCase())).join('')}
+    </div>`:'' }
+  <div id="histList" class="px-5 mt-3 space-y-2.5">${histListHtml()}</div>`;
 }
 function updateHistoryList(){
-  const q=_histQ.toLowerCase();
-  const list=state.workouts.filter(w=> !q || w.name.toLowerCase().includes(q) ||
-    w.exercises.some(e=>e.name.toLowerCase().includes(q)) || (w.date||'').includes(q));
-  const box=$('#histList'); if(box) box.innerHTML = list.length? list.map(historyCard).join('') : `<div class="card p-6 text-center text-mute text-sm">No workouts found.</div>`;
+  const box=$('#histList'); if(box) box.innerHTML = histListHtml();
 }
 function historyCard(w){
   const ip=w.status==='in_progress';
-  return `<button onclick="editWorkout('${w.workoutId}')" class="btn-press w-full card p-4 text-left">
+  const reps=workoutReps(w), hold=workoutHold(w);
+  return `<button onclick="editWorkout('${w.workoutId}')" class="btn-press w-full chip rounded-xl p-3 text-left">
     <div class="flex items-center justify-between gap-2">
-      <h3 class="font-display font-700 text-lg truncate">${esc(w.name)}</h3>
+      <h3 class="font-display font-700 text-base truncate">${esc(w.name)}</h3>
       ${ ip ? `<span class="text-[10px] font-bold tracking-widest accent-text shrink-0">● LIVE</span>` : `<span class="text-mute text-xs shrink-0">${fmtDateShort(w.date)}</span>` }
     </div>
-    <div class="flex gap-4 mt-2 text-sm">
+    <div class="flex flex-wrap gap-x-3 gap-y-1 mt-1.5 text-xs">
       <span class="text-mute"><b class="text-white font-display">${(w.exercises||[]).length}</b> ex</span>
       <span class="text-mute"><b class="text-white font-display">${workoutSetsDone(w)}</b> sets</span>
-      <span class="text-mute"><b class="accent-text font-display">${fmtVol(workoutVolume(w))}</b> ${state.unit}</span>
+      ${ reps ? `<span class="text-mute"><b class="text-white font-display">${fmtInt(reps)}</b> reps</span>`:'' }
+      ${ hold ? `<span class="text-mute"><b class="text-white font-display">${fmtDur(hold)}</b> held</span>`:'' }
+      <span class="text-mute"><b class="accent-text font-display">${fmtVol(workoutWork(w))}</b> ${state.unit}</span>
     </div>
-    <div class="flex flex-wrap gap-1.5 mt-2.5">
-      ${ (w.exercises||[]).slice(0,4).map(e=>`<span class="chip text-[11px] px-2 py-0.5 rounded-full text-mute">${esc(e.name)}</span>`).join('') }
+    <div class="flex flex-wrap gap-1.5 mt-2">
+      ${ (w.exercises||[]).slice(0,4).map(e=>`<span class="bg-panel2 border border-line text-[11px] px-2 py-0.5 rounded-full text-mute">${esc(e.name)}</span>`).join('') }
       ${ (w.exercises||[]).length>4 ? `<span class="text-[11px] text-mute px-1 py-0.5">+${w.exercises.length-4}</span>`:'' }
     </div>
   </button>`;
@@ -1482,24 +1788,37 @@ function allExerciseStats(src){
   (src || state.workouts.filter(w=>w.status==='completed')).forEach(w=>{
     (w.exercises||[]).forEach(e=>{
       const k=e.name.toLowerCase();
-      if(!map[k]) map[k]={ name:e.name, sessions:0, maxWeight:0, maxReps:0, maxOneRm:0, totalVolume:0, points:[], bestWeightDate:'', bestRepsDate:'' };
+      if(!map[k]) map[k]={ name:e.name, type:effectiveType(e), group:muscleGroup(e.name), sessions:0,
+        maxWeight:0, maxReps:0, maxHold:0, maxOneRm:0, maxSessionReps:0, maxSessionWork:0,
+        totalVolume:0, totalWork:0, totalReps:0, totalHold:0,
+        points:[], bestWeightDate:'', bestRepsDate:'', bestSessionDate:'' };
       const m=map[k]; m.sessions++;
-      let sessVol=0, sessMaxW=0, sessMaxR=0, sessRm=0;
+      const type=effectiveType(e); m.type=type;
+      let sessVol=0, sessWork=0, sessReps=0, sessHold=0, sessMaxW=0, sessMaxR=0, sessMaxH=0, sessRm=0;
       e.sets.forEach(s=>{ if(!s.completed) return; const wt=num(s.weight), rp=num(s.reps);
-        sessVol+=wt*rp; if(wt>sessMaxW) sessMaxW=wt; if(rp>sessMaxR) sessMaxR=rp;
+        sessVol+=wt*rp; sessWork+=setWork(e.name,type,s);
+        if(type==='timed'){ sessHold+=rp; if(rp>sessMaxH) sessMaxH=rp; }
+        else { sessReps+=rp; if(rp>sessMaxR) sessMaxR=rp; }
+        if(wt>sessMaxW) sessMaxW=wt;
         const rm=wt*(1+rp/30); if(rm>sessRm) sessRm=rm; });
-      m.totalVolume+=sessVol;
-      m.points.push({date:w.date, volume:sessVol, maxWeight:sessMaxW, maxReps:sessMaxR, oneRm:sessRm});
+      m.totalVolume+=sessVol; m.totalWork+=sessWork; m.totalReps+=sessReps; m.totalHold+=sessHold;
+      m.points.push({date:w.date, volume:sessVol, work:sessWork, reps:sessReps, hold:sessHold,
+        maxWeight:sessMaxW, maxReps:sessMaxR, maxHold:sessMaxH, oneRm:sessRm});
     });
   });
   Object.values(map).forEach(m=>{
     m.points.sort((a,b)=>(a.date||'').localeCompare(b.date||''));
-    let rw=0, rr=0;                                  // running maxima -> PR flags
+    let rw=0, rr=0, rh=0, rsr=0, rsw=0;              // running maxima -> PR flags
     m.points.forEach(p=>{
       p.weightPR = p.maxWeight>rw && p.maxWeight>0; if(p.weightPR){ rw=p.maxWeight; m.bestWeightDate=p.date; }
       p.repsPR   = p.maxReps>rr   && p.maxReps>0;   if(p.repsPR){   rr=p.maxReps;   m.bestRepsDate=p.date; }
+      p.holdPR   = p.maxHold>rh   && p.maxHold>0;   if(p.holdPR)    rh=p.maxHold;
+      // session-total records: the record a bodyweight movement can actually break
+      p.sessionRepsPR = p.reps>rsr && p.reps>0;     if(p.sessionRepsPR) rsr=p.reps;
+      p.sessionPR     = p.work>rsw && p.work>0;     if(p.sessionPR){ rsw=p.work; m.bestSessionDate=p.date; }
     });
-    m.maxWeight=rw; m.maxReps=rr; m.maxOneRm=Math.max(0,...m.points.map(p=>p.oneRm));
+    m.maxWeight=rw; m.maxReps=rr; m.maxHold=rh; m.maxSessionReps=rsr; m.maxSessionWork=rsw;
+    m.maxOneRm=Math.max(0,...m.points.map(p=>p.oneRm));
   });
   return Object.values(map).sort((a,b)=>b.sessions-a.sessions);
 }
@@ -1516,7 +1835,7 @@ function weeklySeries(tf){
   let cur=weekStartDate(startIso); const end=weekStartDate(todayISO());
   const buckets=[], idx={};
   while(cur<=end && buckets.length<80){ const k=cur.toISOString().slice(0,10); idx[k]=buckets.length; buckets.push({k,count:0,vol:0}); cur.setDate(cur.getDate()+7); }
-  done.forEach(w=>{ if(cut && w.date<cut) return; const i=idx[weekKey(w.date)]; if(i!=null){ buckets[i].count++; buckets[i].vol+=workoutVolume(w); } });
+  done.forEach(w=>{ if(cut && w.date<cut) return; const i=idx[weekKey(w.date)]; if(i!=null){ buckets[i].count++; buckets[i].vol+=workoutWork(w); } });
   return {
     labels: buckets.map(b=>new Date(b.k+'T00:00:00').toLocaleDateString(undefined,{month:'short',day:'numeric'})),
     counts: buckets.map(b=>b.count),
@@ -1566,6 +1885,39 @@ function longestWeekRun(weekKeys){
 function weekStreakMin(ws,min){ const wk={}; ws.forEach(w=>{ const k=weekKey(w.date); wk[k]=(wk[k]||0)+1; });
   return longestWeekRun(Object.keys(wk).filter(k=>wk[k]>=min)); }
 
+/* =================================================================
+   MILESTONES — categorised, and deliberately endless.
+   -----------------------------------------------------------------
+   The old list topped out at the Quarter-Million Club and then there was
+   nothing left to chase. Every cumulative milestone here is a LADDER: a
+   hand-picked run of rungs, and once you pass the top rung the ladder grows
+   itself (each new rung a multiple of the last), so a target always exists.
+   Rung sizes are scaled to a real Kinetic Haus session — roughly 20–30k of
+   work, ~290 reps and ~3 minutes of holds across 24 sets — so the early rungs
+   land in weeks and the far ones stay years away.
+   ================================================================= */
+function roundNice(n){
+  const mag=Math.pow(10, Math.max(0, Math.floor(Math.log10(n))-1));
+  return Math.round(n/mag)*mag;
+}
+/* All rungs up to and including the first one you have NOT cleared. */
+function tierList(base, value, growth){
+  growth=growth||2;
+  const out=base.slice();
+  let last=out[out.length-1], guard=0;
+  while(value>=last && guard++<40){ last=roundNice(last*growth); out.push(last); }
+  return out;
+}
+function ladder(o){
+  return tierList(o.base, o.value, o.growth).map(t=>({
+    cat:o.cat, lad:o.id, id:o.id+'_'+t, icon:o.icon,
+    name:o.name(t), desc:o.desc(t), earned:o.value>=t, progress:o.value, goal:t
+  }));
+}
+const CLUB_NAMES = { 250000:'Quarter-Million Club', 500000:'Half-Million Club', 1000000:'Million Pound Club' };
+function clubName(t){ return CLUB_NAMES[t] || (fmtVol(t)+' Club'); }
+const CAT_ORDER = ['Showing Up','Weight Moved','Bodyweight & Holds','Strength & PRs','Milestones'];
+
 function computeBadges(src){
   const ws=(src || state.workouts.filter(w=>w.status==='completed')).slice().sort((a,b)=>(a.date||'').localeCompare(b.date||''));
   const count=ws.length;
@@ -1589,38 +1941,131 @@ function computeBadges(src){
   const seedNames=['Legs & Functional Core','Upper Body & Toning','Chest & Arms','Back, Shoulders & Core'];
   const usedAllSeed=seedNames.every(n=>ws.some(w=>w.name===n));
   const u=state.unit;
-  return [
-    // — consistency / showing up —
-    {id:'first',    icon:'flag',    name:'First Rep',          desc:'Log your first workout',            earned:count>=1,   progress:count, goal:1},
-    {id:'w10',      icon:'medal',   name:'Committed',          desc:'10 workouts logged',                earned:count>=10,  progress:count, goal:10},
-    {id:'w25',      icon:'trophy',  name:'Dedicated',          desc:'25 workouts logged',                earned:count>=25,  progress:count, goal:25},
-    {id:'w50',      icon:'trophy',  name:'Seasoned',           desc:'50 workouts logged',                earned:count>=50,  progress:count, goal:50},
-    {id:'w100',     icon:'crown',   name:'Centurion',          desc:'100 workouts logged',               earned:count>=100, progress:count, goal:100},
-    // — streaks / few rest days (heavily incentivized) —
-    {id:'day7',     icon:'flame',   name:'7-Day Streak',       desc:'Train 7 days in a row',             earned:dayStreak>=7,  progress:dayStreak, goal:7},
-    {id:'day14',    icon:'flame',   name:'Two-Week Grind',     desc:'Train 14 days in a row',            earned:dayStreak>=14, progress:dayStreak, goal:14},
-    {id:'day30',    icon:'crown',   name:'30-Day Beast',       desc:'Train 30 days in a row',            earned:dayStreak>=30, progress:dayStreak, goal:30},
-    {id:'perfweek', icon:'star',    name:'Perfect Week',       desc:'5+ workouts in one week',           earned:perfectWeek},
-    {id:'wk4',      icon:'flame',   name:'On a Roll',          desc:'4 straight weeks of 3+ workouts',   earned:wkStreak3>=4, progress:wkStreak3, goal:4},
-    {id:'wk8',      icon:'flame',   name:'Unstoppable',        desc:'8 straight weeks of 3+ workouts',   earned:wkStreak3>=8, progress:wkStreak3, goal:8},
-    {id:'ironmonth',icon:'mountain',name:'Iron Month',         desc:'20 workouts in a calendar month',   earned:ironMonth},
-    // — mornings —
-    {id:'early',    icon:'sun',     name:'Early Bird',         desc:'Finish a workout before 7am',       earned:earlyAny},
-    {id:'morning',  icon:'sun',     name:'Morning Person',     desc:'10 workouts before 9am',            earned:mornCount>=10, progress:mornCount, goal:10},
-    // — big sessions (volume per workout) —
-    {id:'heavy',    icon:'bolt',    name:'Heavy Day',          desc:`15,000 ${u} in one session`,        earned:bigDay>=15000, progress:Math.round(bigDay), goal:15000},
-    {id:'beast',    icon:'bolt',    name:'Beast Mode',         desc:`25,000 ${u} in one session`,        earned:bigDay>=25000, progress:Math.round(bigDay), goal:25000},
-    {id:'workhorse',icon:'mountain',name:'Workhorse',          desc:`40,000 ${u} in one session`,        earned:bigDay>=40000, progress:Math.round(bigDay), goal:40000},
-    // — progressive overload / muscle growth (most rewarded) —
-    {id:'pr',       icon:'bolt',    name:'PR Setter',          desc:'Beat a previous best',              earned:anyPR},
-    {id:'stronger', icon:'star',    name:'Stronger Every Week',desc:'Set PRs in 3 different weeks',       earned:prWeeks.size>=3, progress:prWeeks.size, goal:3},
-    {id:'overload', icon:'dumbbell',name:'Progressive Overload',desc:'Add 50% to a lift over time',      earned:overload},
-    {id:'repgrow',  icon:'dumbbell',name:'Rep Machine',        desc:'Grow reps 50% on a movement',       earned:repGrowth},
-    {id:'specialist',icon:'medal',  name:'Specialist',         desc:'Train one exercise in 10 sessions', earned:maxSessions>=10, progress:maxSessions, goal:10},
-    // — exploration / long-term —
-    {id:'full',     icon:'crown',   name:'Full Haus',          desc:'Use all 4 day templates',           earned:usedAllSeed},
-    {id:'quarter',  icon:'mountain',name:'Quarter-Million Club',desc:`250,000 ${u} lifted all-time`,     earned:totalVol>=250000, progress:Math.round(totalVol), goal:250000},
-  ];
+
+  // ---- totals that now include bodyweight and timed work ----
+  const totalWork  = ws.reduce((a,w)=>a+workoutWork(w),0);
+  const bigWork    = ws.reduce((m,w)=>Math.max(m,workoutWork(w)),0);
+  const totalSets  = ws.reduce((a,w)=>a+workoutSetsDone(w),0);
+  const totalReps  = ws.reduce((a,w)=>a+workoutReps(w),0);
+  const totalHold  = ws.reduce((a,w)=>a+workoutHold(w),0);
+  const bwStats    = stats.filter(m=>m.type==='bodyweight');
+  const tmStats    = stats.filter(m=>m.type==='timed');
+  const bwReps     = bwStats.reduce((a,m)=>a+m.totalReps,0);
+  const bwWork     = stats.filter(m=>m.type!=='weighted').reduce((a,m)=>a+m.totalWork,0);
+  const bestSessionReps = ws.reduce((m,w)=>Math.max(m,workoutReps(w)),0);
+  const maxOneRm   = stats.reduce((m,x)=>Math.max(m,x.maxOneRm),0);
+  const exTried    = stats.length;
+  const daysUsed   = new Set(ws.map(w=>(w.name||'').trim().toLowerCase()).filter(Boolean)).size;
+  const trainDays  = dateSet.size;
+  const bwPRs      = stats.reduce((a,m)=>a+m.points.filter((p,i)=>i>0&&(p.sessionRepsPR||p.holdPR)).length,0);
+
+  const out=[];
+  const push=(...b)=>out.push(...b);
+
+  /* ---------------- SHOWING UP ---------------- */
+  const C1='Showing Up';
+  push(...ladder({cat:C1, id:'wcount', icon:'flag', base:[1,10,25,50,100,200,365,500,750,1000], value:count, growth:1.5,
+    name:t=>t===1?'First Rep':t+' Workouts', desc:t=>t===1?'Log your first workout':`Log ${fmtInt(t)} workouts`}));
+  push(...ladder({cat:C1, id:'daystreak', icon:'flame', base:[3,7,14,30,60,100,200,365], value:dayStreak, growth:1.5,
+    name:t=>t+'-Day Streak', desc:t=>`Train ${t} days in a row`}));
+  push(...ladder({cat:C1, id:'wkstreak', icon:'flame', base:[4,8,12,26,52,104], value:wkStreak3, growth:2,
+    name:t=>t+' Solid Weeks', desc:t=>`${t} straight weeks of 3+ workouts`}));
+  push(...ladder({cat:C1, id:'traindays', icon:'star', base:[25,50,100,250,500,1000], value:trainDays, growth:2,
+    name:t=>fmtInt(t)+' Training Days', desc:t=>`Train on ${fmtInt(t)} separate days`}));
+  push(
+    {cat:C1, id:'perfweek', icon:'star',    name:'Perfect Week', desc:'5+ workouts in one week',         earned:perfectWeek},
+    {cat:C1, id:'ironmonth',icon:'mountain',name:'Iron Month',   desc:'20 workouts in a calendar month', earned:ironMonth},
+    {cat:C1, id:'early',    icon:'sun',     name:'Early Bird',   desc:'Finish a workout before 7am',     earned:earlyAny},
+  );
+  push(...ladder({cat:C1, id:'morning', icon:'sun', base:[10,25,50,100,250], value:mornCount, growth:2,
+    name:t=>t+' Mornings', desc:t=>`${t} workouts finished before 9am`}));
+
+  /* ---------------- WEIGHT MOVED ---------------- */
+  const C2='Weight Moved';
+  push(...ladder({cat:C2, id:'work', icon:'mountain',
+    base:[100e3,250e3,500e3,1e6,2e6,3.5e6,5e6,7.5e6,10e6,15e6,25e6,50e6,75e6,100e6], value:totalWork, growth:2,
+    name:t=>clubName(t), desc:t=>`${fmtInt(t)} ${u} of total work all-time`}));
+  push(...ladder({cat:C2, id:'iron', icon:'dumbbell',
+    base:[250e3,500e3,1e6,2.5e6,5e6,10e6,25e6,50e6], value:totalVol, growth:2,
+    name:t=>fmtVol(t)+' of Iron', desc:t=>`${fmtInt(t)} ${u} from weighted lifts alone`}));
+  push(...ladder({cat:C2, id:'bigday', icon:'bolt',
+    base:[15e3,25e3,40e3,55e3,70e3,90e3,120e3,150e3], value:bigWork, growth:1.35,
+    name:t=>fmtVol(t)+' Session', desc:t=>`${fmtInt(t)} ${u} of work in one session`}));
+  push(...ladder({cat:C2, id:'sets', icon:'dumbbell', base:[100,500,1000,2500,5000,10e3,25e3,50e3], value:totalSets, growth:2,
+    name:t=>fmtInt(t)+' Sets', desc:t=>`Complete ${fmtInt(t)} sets all-time`}));
+
+  /* ---------------- BODYWEIGHT & HOLDS ----------------
+     Everything here scores movements that never earned a pound before. */
+  const C3='Bodyweight & Holds';
+  push(...ladder({cat:C3, id:'bwreps', icon:'bolt', base:[250,1000,2500,5000,10e3,25e3,50e3,100e3], value:bwReps, growth:2,
+    name:t=>fmtInt(t)+' BW Reps', desc:t=>`${fmtInt(t)} bodyweight reps all-time`}));
+  push(...ladder({cat:C3, id:'bwwork', icon:'mountain', base:[25e3,100e3,250e3,500e3,1e6,2.5e6,5e6], value:bwWork, growth:2,
+    name:t=>fmtVol(t)+' Moved Raw', desc:t=>`${fmtInt(t)} ${u} moved with no equipment`}));
+  push(...ladder({cat:C3, id:'hold', icon:'flame', base:[600,1800,3600,3*3600,6*3600,12*3600,24*3600], value:totalHold, growth:2,
+    name:t=>fmtDur(t)+' Under Tension', desc:t=>`${fmtDur(t)} of planks, holds and carries`}));
+  push(...ladder({cat:C3, id:'sessreps', icon:'star', base:[100,200,300,400,500,650,800,1000], value:bestSessionReps, growth:1.3,
+    name:t=>t+' Reps in a Day', desc:t=>`${t} reps in a single workout`}));
+  push(...ladder({cat:C3, id:'bwpr', icon:'trophy', base:[1,5,15,30,60,120], value:bwPRs, growth:2,
+    name:t=>t===1?'Raw Record':t+' Raw Records', desc:t=>`Break ${t} bodyweight or hold record${t>1?'s':''}`}));
+
+  // Per-movement clubs, built from the movements YOU actually repeat.
+  bwStats.slice().sort((a,b)=>b.totalReps-a.totalReps).slice(0,4).forEach(m=>{
+    if(m.totalReps<10) return;
+    push(...ladder({cat:C3, id:'club_'+m.name.toLowerCase().replace(/\W+/g,''), icon:'medal',
+      base:[100,250,500,1000,2500,5000,10e3,25e3], value:m.totalReps, growth:2,
+      name:t=>fmtVol(t)+' '+m.name, desc:t=>`${fmtInt(t)} lifetime ${m.name} reps`}));
+  });
+  tmStats.slice().sort((a,b)=>b.totalHold-a.totalHold).slice(0,2).forEach(m=>{
+    if(m.totalHold<60) return;
+    push(...ladder({cat:C3, id:'hclub_'+m.name.toLowerCase().replace(/\W+/g,''), icon:'medal',
+      base:[300,900,1800,3600,2*3600,5*3600,10*3600], value:m.totalHold, growth:2,
+      name:t=>fmtDur(t)+' '+m.name, desc:t=>`${fmtDur(t)} of ${m.name} all-time`}));
+  });
+
+  /* ---------------- STRENGTH & PRs ---------------- */
+  const C4='Strength & PRs';
+  push(...ladder({cat:C4, id:'onerm', icon:'trophy', base:[95,135,185,225,275,315,365,405,495,585], value:maxOneRm, growth:1.2,
+    name:t=>fmtInt(t)+' '+u+' Club', desc:t=>`Reach an estimated ${fmtInt(t)} ${u} one-rep max`}));
+  push(...ladder({cat:C4, id:'prweeks', icon:'star', base:[3,10,25,50,100], value:prWeeks.size, growth:2,
+    name:t=>'PRs in '+t+' Weeks', desc:t=>`Set a personal best in ${t} different weeks`}));
+  push(...ladder({cat:C4, id:'special', icon:'medal', base:[10,25,50,100,200], value:maxSessions, growth:2,
+    name:t=>t+'× Specialist', desc:t=>`Train one exercise in ${t} sessions`}));
+  push(
+    {cat:C4, id:'pr',       icon:'bolt',    name:'PR Setter',           desc:'Beat a previous best',        earned:anyPR},
+    {cat:C4, id:'overload', icon:'dumbbell',name:'Progressive Overload',desc:'Add 50% to a lift over time', earned:overload},
+    {cat:C4, id:'repgrow',  icon:'dumbbell',name:'Rep Machine',         desc:'Grow reps 50% on a movement', earned:repGrowth},
+  );
+
+  /* ---------------- MILESTONES / EXPLORATION ---------------- */
+  const C5='Milestones';
+  push(...ladder({cat:C5, id:'reps', icon:'bolt', base:[1000,5000,10e3,25e3,50e3,100e3,250e3,500e3], value:totalReps, growth:2,
+    name:t=>fmtVol(t)+' Reps', desc:t=>`${fmtInt(t)} reps logged all-time`}));
+  push(...ladder({cat:C5, id:'extried', icon:'star', base:[10,25,50,75,100,150,200], value:exTried, growth:1.5,
+    name:t=>t+' Movements', desc:t=>`Log ${t} different exercises`}));
+  push(...ladder({cat:C5, id:'daysused', icon:'crown', base:[4,6,8,12,16], value:daysUsed, growth:1.5,
+    name:t=>t+' Day Types', desc:t=>`Train ${t} different named workouts`}));
+  push({cat:C5, id:'full', icon:'crown', name:'Full Haus', desc:'Use all 4 starter day templates', earned:usedAllSeed});
+
+  return out;
+}
+/* Milestones grouped for the collapsible Progress accordion. Within each ladder we
+   only surface what you have already earned plus the next two rungs, so the grid
+   never becomes the wall of locked tiles an endless ladder would otherwise be. */
+function badgeCategories(src){
+  const all=computeBadges(src);
+  const byCat={};
+  all.forEach(b=>{ (byCat[b.cat=b.cat||'Milestones']=byCat[b.cat]||[]).push(b); });
+  return CAT_ORDER.filter(c=>byCat[c]).map(c=>{
+    const list=byCat[c];
+    const shown=[], seen={};
+    list.forEach(b=>{
+      if(!b.lad){ shown.push(b); return; }
+      if(b.earned){ shown.push(b); return; }
+      seen[b.lad]=(seen[b.lad]||0)+1;
+      if(seen[b.lad]<=2) shown.push(b);            // the next two rungs of this ladder
+    });
+    return { name:c, all:list, shown, earned:list.filter(b=>b.earned).length, total:list.length };
+  });
 }
 function badgeTile(b){
   const ring = b.earned ? 'edge-ring' : 'border border-line';
@@ -1635,7 +2080,7 @@ function badgeTile(b){
 }
 function badgeInfo(id){
   const b=computeBadges().find(x=>x.id===id); if(!b) return;
-  const status = b.earned ? 'Unlocked' : (b.goal ? `${Math.min(b.progress||0,b.goal)} / ${b.goal}` : 'Locked');
+  const status = b.earned ? 'Unlocked' : (b.goal ? `${fmtInt(Math.min(b.progress||0,b.goal))} / ${fmtInt(b.goal)}` : 'Locked');
   modal(`<div class="p-6 text-center">
     <div class="mx-auto w-20 h-20 rounded-2xl ${b.earned?'edge-ring':'border border-line'} bg-panel2 flex items-center justify-center ${b.earned?'text-white':'text-mute opacity-50'} mb-3">
       <div class="scale-150">${badgeIcon(b.icon)}</div>
@@ -1649,12 +2094,64 @@ function badgeInfo(id){
 
 let _tf='6w';
 function setTf(tf){ _tf=tf; render(); }
+
+/* ---------- collapsible sections (nothing on this app scrolls forever) ---------- */
+let _openCat={}, _openGrp={}, _catAll={};
+function toggleCat(n){ _openCat[n]=!_openCat[n]; refreshBadges(); }
+function toggleCatAll(n){ _catAll[n]=!_catAll[n]; refreshBadges(); }
+function toggleGrp(n){ _openGrp[n]=!_openGrp[n]; refreshExGroups(); }
+function refreshBadges(){ const b=$('#badgeAccordion'); if(b) b.innerHTML=badgeAccordionHtml(); }
+function refreshExGroups(){ const b=$('#exGroups'); if(b) b.innerHTML=exGroupsHtml(); }
+
+function sectionHead(open, title, right, act){
+  return `<button onclick="${act}" class="w-full flex items-center justify-between gap-2 px-4 py-3 btn-press text-left">
+    <span class="font-display font-600 text-sm tracking-[.12em] ${open?'text-white':'text-mute'}">${esc(title)}</span>
+    <span class="flex items-center gap-2 shrink-0">
+      <span class="text-[11px] font-bold text-mute tabular-nums">${right}</span>
+      <svg class="w-4 h-4 text-mute transition-transform ${open?'rotate-180':''}" fill="none" stroke="currentColor" stroke-width="2.4" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m6 9 6 6 6-6"/></svg>
+    </span>
+  </button>`;
+}
+function badgeAccordionHtml(){
+  const cats=badgeCategories();
+  if(!cats.length) return `<div class="card p-6 text-center text-mute text-sm">Finish a workout to start unlocking milestones.</div>`;
+  return cats.map((c,idx)=>{
+    const open = _openCat[c.name] !== undefined ? _openCat[c.name] : idx===0;
+    const list = _catAll[c.name] ? c.all : c.shown;
+    return `<div class="card overflow-hidden">
+      ${ sectionHead(open, c.name.toUpperCase(), c.earned+'/'+c.total, `toggleCat('${esc(c.name)}')`) }
+      ${ open ? `<div class="px-3 pb-3">
+          <div class="grid grid-cols-4 gap-2">${ list.map(badgeTile).join('') }</div>
+          ${ c.all.length>c.shown.length ? `<button onclick="toggleCatAll('${esc(c.name)}')" class="w-full text-center text-[11px] font-semibold text-mute mt-2.5 py-1 btn-press">${_catAll[c.name]?'Show fewer':'Show all '+c.all.length+' — including future targets'}</button>`:'' }
+        </div>` : '' }
+    </div>`;
+  }).join('');
+}
+function exGroupsHtml(){
+  const stats=allExerciseStats();
+  if(!stats.length) return `<div class="card p-6 text-center text-mute text-sm">Complete a workout to see progress.</div>`;
+  const by={};
+  stats.forEach(m=>{ (by[m.group]=by[m.group]||[]).push(m); });
+  const groups=MUSCLE_ORDER.filter(g=>by[g]);
+  return groups.map((g,idx)=>{
+    const open = _openGrp[g] !== undefined ? _openGrp[g] : idx===0;
+    const list=by[g];
+    const sess=list.reduce((a,m)=>a+m.sessions,0);
+    return `<div class="card overflow-hidden">
+      ${ sectionHead(open, g.toUpperCase(), list.length+' · '+sess+' sess', `toggleGrp('${esc(g)}')`) }
+      ${ open ? `<div class="px-3 pb-3 space-y-2">${ list.map(exerciseRow).join('') }</div>` : '' }
+    </div>`;
+  }).join('');
+}
+
 function viewProgress(){
   const done=state.workouts.filter(w=>w.status==='completed');
-  const totalVol=done.reduce((a,w)=>a+workoutVolume(w),0);
+  const totalWork=done.reduce((a,w)=>a+workoutWork(w),0);
   const totalSets=done.reduce((a,w)=>a+workoutSetsDone(w),0);
-  const stats=allExerciseStats();
-  const badges=computeBadges(); const earned=badges.filter(b=>b.earned).length;
+  const cats=badgeCategories();
+  const earned=cats.reduce((a,c)=>a+c.earned,0), totalB=cats.reduce((a,c)=>a+c.total,0);
+  const nextUp=computeBadges().filter(b=>!b.earned && b.goal).sort((a,b)=>
+    ((b.progress||0)/b.goal)-((a.progress||0)/a.goal))[0];
   const TF=[['6w','6 W'],['12w','12 W'],['26w','6 M'],['all','All']];
 
   return `
@@ -1668,19 +2165,32 @@ function viewProgress(){
 
   <div class="px-5 mt-4 grid grid-cols-2 gap-3">
     ${statTile('Workouts', done.length)}
-    ${statTile('Total volume', fmtVol(totalVol)+' '+state.unit)}
-    ${statTile('Sets logged', totalSets)}
+    ${statTile('Total work', fmtVol(totalWork)+' '+state.unit)}
+    ${statTile('Sets logged', fmtInt(totalSets))}
     ${statTile('Week streak', weekStreak())}
   </div>
 
+  ${ nextUp ? `<div class="px-5 mt-3">
+    <button onclick="badgeInfo('${nextUp.id}')" class="btn-press w-full card p-4 text-left flex items-center gap-3">
+      <div class="w-10 h-10 rounded-xl border border-line bg-panel2 flex items-center justify-center text-mute shrink-0">${badgeIcon(nextUp.icon)}</div>
+      <div class="min-w-0 flex-1">
+        <div class="text-[10px] font-bold tracking-widest text-mute">NEXT MILESTONE</div>
+        <div class="font-display font-700 truncate">${esc(nextUp.name)}</div>
+        <div class="h-1 rounded-full bg-line overflow-hidden mt-1.5"><div class="h-full bg-white/60" style="width:${Math.min(100,Math.round(100*(nextUp.progress||0)/nextUp.goal))}%"></div></div>
+      </div>
+      <div class="text-right shrink-0">
+        <div class="font-display font-700 text-sm">${Math.min(99,Math.round(100*(nextUp.progress||0)/nextUp.goal))}%</div>
+        <div class="text-[10px] text-mute">${fmtVol(Math.max(0,nextUp.goal-(nextUp.progress||0)))} to go</div>
+      </div>
+    </button>
+  </div>`:'' }
+
   <!-- Achievements -->
   <div class="px-5 mt-7 flex items-center justify-between">
-    <h2 class="font-display font-600 text-sm tracking-[.15em] text-mute">ACHIEVEMENTS</h2>
-    <span class="text-xs font-bold edge-text">${earned}/${badges.length}</span>
+    <h2 class="font-display font-600 text-sm tracking-[.15em] text-mute">MILESTONES</h2>
+    <span class="text-xs font-bold edge-text">${earned}/${totalB}</span>
   </div>
-  <div class="px-5 mt-3 grid grid-cols-4 gap-2">
-    ${ badges.map(badgeTile).join('') }
-  </div>
+  <div id="badgeAccordion" class="px-5 mt-3 space-y-2.5">${badgeAccordionHtml()}</div>
 
   <!-- Consistency -->
   <div class="px-5 mt-7">
@@ -1690,19 +2200,18 @@ function viewProgress(){
     </div>
   </div>
 
-  <!-- Weight moved -->
+  <!-- Work moved -->
   <div class="px-5 mt-4">
     <div class="card p-4">
-      <h2 class="font-display font-600 text-sm tracking-[.15em] text-mute mb-1">WEIGHT MOVED / WEEK (${state.unit})</h2>
+      <h2 class="font-display font-600 text-sm tracking-[.15em] text-mute mb-1">WORK / WEEK (${state.unit})</h2>
+      <p class="text-[11px] text-mute mb-1">Bodyweight reps and holds are counted at your body weight.</p>
       <div class="h-40"><canvas id="volWeekChart"></canvas></div>
     </div>
   </div>
 
   <div class="px-5 mt-6">
     <h2 class="font-display font-600 text-sm tracking-[.15em] text-mute mb-3">EXERCISES</h2>
-    <div class="space-y-3">
-      ${ stats.length ? stats.map(exerciseRow).join('') : `<div class="card p-6 text-center text-mute text-sm">Complete a workout to see progress.</div>` }
-    </div>
+    <div id="exGroups" class="space-y-2.5">${exGroupsHtml()}</div>
   </div>`;
 }
 function statTile(label,val){
@@ -1711,16 +2220,30 @@ function statTile(label,val){
     <div class="text-mute text-xs mt-0.5 font-semibold tracking-wide">${label}</div>
   </div>`;
 }
+/* One row per exercise, phrased in that exercise's own units — a weighted lift
+   leads with its 1RM, a bodyweight movement with lifetime reps, a hold with time. */
 function exerciseRow(m){
-  const recentPR = m.bestWeightDate && (Date.now()-new Date(m.bestWeightDate+'T00:00:00').getTime() < 21*864e5);
-  return `<button data-act="openEx" data-val="${esc(m.name)}" class="btn-press w-full card p-4 text-left flex items-center justify-between">
+  const prDate = m.type==='weighted' ? m.bestWeightDate : (m.bestSessionDate||m.bestRepsDate);
+  const recentPR = prDate && (Date.now()-new Date(prDate+'T00:00:00').getTime() < 21*864e5);
+  let sub, big, cap;
+  if(m.type==='timed'){
+    sub=`${m.sessions} sessions · best ${fmtDur(m.maxHold)} hold`;
+    big=fmtDur(m.totalHold); cap='TOTAL TIME';
+  } else if(m.type==='bodyweight'){
+    sub=`${m.sessions} sessions · best ${m.maxReps} reps · ${m.maxSessionReps} in a session`;
+    big=fmtVol(m.totalReps); cap='TOTAL REPS';
+  } else {
+    sub=`${m.sessions} sessions · best ${Math.round(m.maxWeight)} ${state.unit} × ${m.maxReps} reps`;
+    big=Math.round(m.maxOneRm); cap='EST 1RM';
+  }
+  return `<button data-act="openEx" data-val="${esc(m.name)}" class="btn-press w-full chip rounded-xl p-3 text-left flex items-center justify-between">
     <div class="min-w-0">
-      <h3 class="font-display font-600 text-lg truncate">${esc(m.name)} ${recentPR?'<span class="text-[10px] font-bold edge-text align-middle ml-1">NEW PR</span>':''}</h3>
-      <p class="text-mute text-xs mt-0.5">${m.sessions} sessions · best ${Math.round(m.maxWeight)} ${state.unit} × ${m.maxReps} reps</p>
+      <h3 class="font-display font-600 text-base truncate">${esc(m.name)} ${recentPR?'<span class="text-[10px] font-bold edge-text align-middle ml-1">NEW PR</span>':''}</h3>
+      <p class="text-mute text-[11px] mt-0.5 truncate">${esc(sub)}</p>
     </div>
     <div class="text-right shrink-0 ml-3">
-      <div class="font-display font-700 text-white">${Math.round(m.maxOneRm)}</div>
-      <div class="text-[10px] text-mute tracking-widest">EST 1RM</div>
+      <div class="font-display font-700 text-white">${big}</div>
+      <div class="text-[10px] text-mute tracking-widest">${cap}</div>
     </div>
   </button>`;
 }
@@ -1743,8 +2266,8 @@ function drawProgressCharts(){
 /* =================================================================
    EXERCISE DETAIL
    ================================================================= */
-let _exName='';
-function openExercise(name){ _exName=name; go('exercise'); }
+let _exName='', _exAllLogs=false;
+function openExercise(name){ _exName=name; _exAllLogs=false; go('exercise'); }
 function viewExerciseDetail(){
   const m=allExerciseStats().find(x=>x.name.toLowerCase()===_exName.toLowerCase());
   if(!m) return `<div class="px-5 pt-20 text-center text-mute">No data.<button onclick="go('progress')" class="block mx-auto mt-3 accent-text font-semibold">Back</button></div>`;
@@ -1758,51 +2281,89 @@ function viewExerciseDetail(){
     <h1 class="font-display font-700 text-xl truncate">${esc(m.name)}</h1>
   </div>
 
-  <!-- PR cards -->
+  <!-- PR cards — a bodyweight movement is graded on reps and session totals,
+       a hold on time, a weighted lift on load. -->
   <div class="px-5 mt-4 grid grid-cols-2 gap-3">
-    <div class="card p-4 ${recentW?'edge-ring':''}">
-      <div class="flex items-center gap-1.5 text-mute"><span class="edge-text">${badgeIcon('trophy').replace('w-6 h-6','w-4 h-4')}</span><span class="text-[10px] font-bold tracking-widest">WEIGHT PR</span></div>
-      <div class="font-display font-700 text-2xl mt-1">${Math.round(m.maxWeight)} <span class="text-base text-mute">${state.unit}</span></div>
-      <div class="text-[11px] text-mute mt-0.5">${m.bestWeightDate?fmtDate(m.bestWeightDate):'—'} ${recentW?'· <span class="edge-text font-bold">NEW</span>':''}</div>
-    </div>
-    <div class="card p-4 ${recentR?'edge-ring':''}">
-      <div class="flex items-center gap-1.5 text-mute"><span class="edge-text">${badgeIcon('bolt').replace('w-6 h-6','w-4 h-4')}</span><span class="text-[10px] font-bold tracking-widest">REPS PR</span></div>
-      <div class="font-display font-700 text-2xl mt-1">${m.maxReps} <span class="text-base text-mute">reps</span></div>
-      <div class="text-[11px] text-mute mt-0.5">${m.bestRepsDate?fmtDate(m.bestRepsDate):'—'} ${recentR?'· <span class="edge-text font-bold">NEW</span>':''}</div>
-    </div>
+    ${ m.type==='timed'
+      ? `<div class="card p-4">
+          <div class="flex items-center gap-1.5 text-mute"><span class="edge-text">${badgeIcon('trophy').replace('w-6 h-6','w-4 h-4')}</span><span class="text-[10px] font-bold tracking-widest">LONGEST HOLD</span></div>
+          <div class="font-display font-700 text-2xl mt-1">${fmtDur(m.maxHold)}</div>
+          <div class="text-[11px] text-mute mt-0.5">best single set</div>
+        </div>
+        <div class="card p-4">
+          <div class="flex items-center gap-1.5 text-mute"><span class="edge-text">${badgeIcon('bolt').replace('w-6 h-6','w-4 h-4')}</span><span class="text-[10px] font-bold tracking-widest">BEST SESSION</span></div>
+          <div class="font-display font-700 text-2xl mt-1">${fmtDur(Math.max(...m.points.map(p=>p.hold),0))}</div>
+          <div class="text-[11px] text-mute mt-0.5">total time in one workout</div>
+        </div>`
+      : `<div class="card p-4 ${recentR?'edge-ring':''}">
+          <div class="flex items-center gap-1.5 text-mute"><span class="edge-text">${badgeIcon('bolt').replace('w-6 h-6','w-4 h-4')}</span><span class="text-[10px] font-bold tracking-widest">REPS PR</span></div>
+          <div class="font-display font-700 text-2xl mt-1">${m.maxReps} <span class="text-base text-mute">reps</span></div>
+          <div class="text-[11px] text-mute mt-0.5">${m.bestRepsDate?fmtDate(m.bestRepsDate):'—'} ${recentR?'· <span class="edge-text font-bold">NEW</span>':''}</div>
+        </div>
+        ${ m.type==='bodyweight'
+          ? `<div class="card p-4">
+              <div class="flex items-center gap-1.5 text-mute"><span class="edge-text">${badgeIcon('trophy').replace('w-6 h-6','w-4 h-4')}</span><span class="text-[10px] font-bold tracking-widest">SESSION PR</span></div>
+              <div class="font-display font-700 text-2xl mt-1">${m.maxSessionReps} <span class="text-base text-mute">reps</span></div>
+              <div class="text-[11px] text-mute mt-0.5">most in one workout</div>
+            </div>`
+          : `<div class="card p-4 ${recentW?'edge-ring':''}">
+              <div class="flex items-center gap-1.5 text-mute"><span class="edge-text">${badgeIcon('trophy').replace('w-6 h-6','w-4 h-4')}</span><span class="text-[10px] font-bold tracking-widest">WEIGHT PR</span></div>
+              <div class="font-display font-700 text-2xl mt-1">${Math.round(m.maxWeight)} <span class="text-base text-mute">${state.unit}</span></div>
+              <div class="text-[11px] text-mute mt-0.5">${m.bestWeightDate?fmtDate(m.bestWeightDate):'—'} ${recentW?'· <span class="edge-text font-bold">NEW</span>':''}</div>
+            </div>` }` }
   </div>
   <div class="px-5 mt-3 grid grid-cols-2 gap-3">
-    ${statTile('Est 1RM', Math.round(m.maxOneRm))}
+    ${ m.type==='weighted' ? statTile('Est 1RM', Math.round(m.maxOneRm))
+      : m.type==='timed'   ? statTile('Total time', fmtDur(m.totalHold))
+                           : statTile('Lifetime reps', fmtInt(m.totalReps)) }
     ${statTile('Sessions', m.sessions)}
   </div>
+  <div class="px-5 mt-3 grid grid-cols-2 gap-3">
+    ${statTile('Total work', fmtVol(m.totalWork)+' '+state.unit)}
+    ${statTile('Best session', fmtVol(m.maxSessionWork)+' '+state.unit)}
+  </div>
 
-  <div class="px-5 mt-4">
+  ${ m.type==='weighted' ? `<div class="px-5 mt-4">
     <div class="card p-4">
       <h2 class="font-display font-600 text-sm tracking-[.15em] text-mute mb-1">WEIGHT OVER TIME (${state.unit})</h2>
       <p class="text-[11px] text-mute mb-1">◆ ringed point = personal best</p>
       <div class="h-52"><canvas id="exWeightChart"></canvas></div>
     </div>
-  </div>
+  </div>`:'' }
   <div class="px-5 mt-4">
     <div class="card p-4">
-      <h2 class="font-display font-600 text-sm tracking-[.15em] text-mute mb-1">REPS OVER TIME</h2>
+      <h2 class="font-display font-600 text-sm tracking-[.15em] text-mute mb-1">${ m.type==='timed'?'HOLD TIME OVER TIME (S)':'REPS OVER TIME' }</h2>
+      <p class="text-[11px] text-mute mb-1">◆ ringed point = personal best</p>
       <div class="h-44"><canvas id="exRepsChart"></canvas></div>
     </div>
   </div>
   <div class="px-5 mt-4">
     <div class="card p-4">
-      <h2 class="font-display font-600 text-sm tracking-[.15em] text-mute mb-1">VOLUME PER SESSION</h2>
+      <h2 class="font-display font-600 text-sm tracking-[.15em] text-mute mb-1">${ m.type==='bodyweight'?'REPS PER SESSION':'WORK PER SESSION' }</h2>
       <div class="h-40"><canvas id="exVolChart"></canvas></div>
     </div>
   </div>
   <div class="px-5 mt-4">
-    <h2 class="font-display font-600 text-sm tracking-[.15em] text-mute mb-2">SESSION LOG</h2>
-    <div class="space-y-2">
-      ${ m.points.slice().reverse().map(p=>`<div class="card p-3 flex items-center justify-between text-sm">
-        <span class="text-mute">${fmtDate(p.date)} ${p.weightPR?'<span class="edge-text font-bold ml-1">PR</span>':''}</span>
-        <span class="font-display"><b>${Math.round(p.maxWeight)}</b> ${state.unit} × ${p.maxReps} · ${fmtVol(p.volume)} vol</span></div>`).join('') }
+    <div class="flex items-center justify-between mb-2">
+      <h2 class="font-display font-600 text-sm tracking-[.15em] text-mute">SESSION LOG</h2>
+      <span class="text-[11px] text-mute">${m.points.length} sessions</span>
     </div>
+    <div class="space-y-2">
+      ${ (_exAllLogs ? m.points.slice() : m.points.slice(-8)).reverse().map(p=>exLogRow(p,m.type)).join('') }
+    </div>
+    ${ m.points.length>8 ? `<button onclick="_exAllLogs=!_exAllLogs;render()" class="w-full text-center text-xs font-semibold text-mute mt-3 py-2 btn-press">${_exAllLogs?'Show recent only':'Show all '+m.points.length+' sessions'}</button>`:'' }
   </div>`;
+}
+function exLogRow(p,type){
+  const pr = p.weightPR||p.repsPR||p.holdPR||p.sessionRepsPR;
+  const right = type==='timed'
+    ? `<b>${fmtDur(p.maxHold)}</b> best · ${fmtDur(p.hold)} total`
+    : type==='bodyweight'
+      ? `<b>${p.maxReps}</b> best set · ${p.reps} reps`
+      : `<b>${Math.round(p.maxWeight)}</b> ${state.unit} × ${p.maxReps} · ${fmtVol(p.work)} work`;
+  return `<div class="chip rounded-xl p-3 flex items-center justify-between text-sm gap-2">
+    <span class="text-mute shrink-0">${fmtDate(p.date)} ${pr?'<span class="edge-text font-bold ml-1">PR</span>':''}</span>
+    <span class="font-display text-right truncate">${right}</span></div>`;
 }
 let _exWeightChart=null,_exRepsChart=null,_exVolChart=null;
 function drawExerciseChart(){
@@ -1822,21 +2383,28 @@ function drawExerciseChart(){
         { label:'Est 1RM', data:m.points.map(p=>Math.round(p.oneRm)), borderColor:'rgba(255,255,255,.45)', borderDash:[5,4], fill:false, tension:.3, pointRadius:0 }
       ]}, options:chartOpts(true) });
   }
+  // reps line — or hold-time line for timed movements
+  const timed = m.type==='timed';
   const cvR=$('#exRepsChart');
   if(cvR){ if(_exRepsChart)_exRepsChart.destroy();
+    const series = timed ? m.points.map(p=>p.maxHold) : m.points.map(p=>p.maxReps);
+    const flag   = timed ? m.points.map(p=>p.holdPR)  : m.points.map(p=>p.repsPR);
     _exRepsChart=new Chart(cvR,{ type:'line',
-      data:{ labels, datasets:[{ label:'Max reps', data:m.points.map(p=>p.maxReps),
+      data:{ labels, datasets:[{ label:timed?'Longest hold (s)':'Max reps', data:series,
         borderColor:'#ffffff', backgroundColor:'rgba(255,255,255,.06)', fill:true, tension:.3,
-        pointRadius:m.points.map(p=>p.repsPR?5.5:3),
-        pointBackgroundColor:m.points.map(p=>p.repsPR?'#0a0a0b':'#ffffff'),
-        pointBorderColor:m.points.map(p=>p.repsPR?'#d8ff4f':'#ffffff'),
-        pointBorderWidth:m.points.map(p=>p.repsPR?2.5:1) }]},
+        pointRadius:flag.map(f=>f?5.5:3),
+        pointBackgroundColor:flag.map(f=>f?'#0a0a0b':'#ffffff'),
+        pointBorderColor:flag.map(f=>f?'#d8ff4f':'#ffffff'),
+        pointBorderWidth:flag.map(f=>f?2.5:1) }]},
       options:chartOpts(false) });
   }
+  // per-session totals — reps for bodyweight, work for everything else, so a
+  // push-up history is no longer a chart of flat zeroes
   const cv2=$('#exVolChart');
   if(cv2){ if(_exVolChart)_exVolChart.destroy();
+    const bars = m.type==='bodyweight' ? m.points.map(p=>Math.round(p.reps)) : m.points.map(p=>Math.round(p.work));
     _exVolChart=new Chart(cv2,{ type:'bar',
-      data:{ labels, datasets:[{ data:m.points.map(p=>Math.round(p.volume)), backgroundColor:'rgba(255,255,255,.6)', borderRadius:5, maxBarThickness:22 }]},
+      data:{ labels, datasets:[{ data:bars, backgroundColor:'rgba(255,255,255,.6)', borderRadius:5, maxBarThickness:22 }]},
       options:chartOpts(false) });
   }
 }
@@ -1914,6 +2482,10 @@ function openSettings(){
       <button onclick="setUnit('lbs')" id="unitLbs" class="rounded-xl py-3 font-display font-700 btn-press ${state.unit==='lbs'?'text-ink':'chip text-mute'}" style="${state.unit==='lbs'?'background:var(--volt)':''}">LBS</button>
     </div>
 
+    <label class="text-xs font-bold tracking-widest text-mute">BODY WEIGHT (${state.unit.toUpperCase()})</label>
+    <input id="setBw" type="number" inputmode="decimal" value="${esc(state.bodyWeight)}" placeholder="${BW_DEFAULT}" class="field w-full p-3 text-base mt-1.5 mb-1"/>
+    <p class="text-[11px] text-mute mb-4">Push-ups, chin-ups, planks and crunches move your body, not a dumbbell — so they used to score zero. Now they count the share of your body weight each movement lifts, which is what makes them show up in your totals, charts and milestones. Until you set this we assume ${BW_DEFAULT} ${state.unit}.</p>
+
     <div class="flex items-center justify-between text-xs text-mute mb-4">
       <span>Status</span>
       <span>${ state.gas ? '<b class="text-white">Connected (hosted)</b>' : (state.apiUrl ? (state.online?'<b class="text-white">Connected</b>':'<b class="edge-text">Not reachable</b>') : '<b>Device-only</b>') }</span>
@@ -1937,10 +2509,12 @@ function setUnit(u){
 async function saveSettings(){
   const el=$('#setUrl');
   if(el){ state.apiUrl=el.value.trim(); Store.set(KEY.url,state.apiUrl); }
+  const bw=$('#setBw');
+  if(bw){ const v=num(bw.value); state.bodyWeight = v>0 ? String(v) : ''; Store.set(KEY.bw, state.bodyWeight); }
   cacheSave();
   closeModal(); toast('Settings saved'); render();
   if(state.apiUrl || state.gas){
-    try{ await apiPost('saveSettings',{ settings:{ unit:state.unit } }); }catch(e){}
+    try{ await apiPost('saveSettings',{ settings:{ unit:state.unit, bodyWeight:state.bodyWeight||'' } }); }catch(e){}
     reloadFromCloud(true);
   }
 }
