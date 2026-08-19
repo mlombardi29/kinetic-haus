@@ -1802,7 +1802,7 @@ function allExerciseStats(src){
         if(wt>sessMaxW) sessMaxW=wt;
         const rm=wt*(1+rp/30); if(rm>sessRm) sessRm=rm; });
       m.totalVolume+=sessVol; m.totalWork+=sessWork; m.totalReps+=sessReps; m.totalHold+=sessHold;
-      m.points.push({date:w.date, volume:sessVol, work:sessWork, reps:sessReps, hold:sessHold,
+      m.points.push({id:w.workoutId, date:w.date, volume:sessVol, work:sessWork, reps:sessReps, hold:sessHold,
         maxWeight:sessMaxW, maxReps:sessMaxR, maxHold:sessMaxH, oneRm:sessRm});
     });
   });
@@ -2280,6 +2280,7 @@ function viewExerciseDetail(){
     </button>
     <h1 class="font-display font-700 text-xl truncate">${esc(m.name)}</h1>
   </div>
+  ${ exAnomalyBanner(m.name) }
 
   <!-- PR cards — a bodyweight movement is graded on reps and session totals,
        a hold on time, a weighted lift on load. -->
@@ -2461,8 +2462,153 @@ function confirm2(title,msg,confirmLabel,onYes){
 }
 
 /* =================================================================
+   DATA CHECK — find sessions the numbers say never happened
+   -----------------------------------------------------------------
+   The July 2026 backend glitch (a deploy without LockService) wrote some set
+   rows to the Sheet twice. getData_L groups rows by exercise+order and pushes
+   one set PER ROW without de-duplicating, so a doubled 3x8 entry comes back as
+   six sets numbered 1,1,2,2,3,3 — silently doubling that session's totals and
+   freezing an impossible "best session" record in place.
+
+   A repeated setNumber inside a single exercise is the fingerprint: real sets
+   are always numbered 1..n. We split those into two buckets — identical copies
+   (safe to remove automatically) and copies whose numbers disagree (a human has
+   to look) — and never touch anything on our own.
+   ================================================================= */
+function dataAnomalies(){
+  if(_bestCache.__anom) return _bestCache.__anom;
+  const dup=[], conflict=[], stuck=[], outliers=[];
+  const today=todayISO();
+  state.workouts.forEach(w=>{
+    if(w.status==='in_progress' && w.date){
+      const age=Math.round((new Date(today+'T00:00:00') - new Date(w.date+'T00:00:00'))/864e5);
+      if(age>=14) stuck.push({ workoutId:w.workoutId, date:w.date, name:w.name, age });
+    }
+    (w.exercises||[]).forEach(e=>{
+      const byNum={};
+      (e.sets||[]).forEach(s=>{ const n=Number(s.setNumber)||0; (byNum[n]=byNum[n]||[]).push(s); });
+      Object.keys(byNum).forEach(n=>{
+        const g=byNum[n]; if(g.length<2) return;
+        const identical = g.every(s => String(s.weight)===String(g[0].weight)
+                                    && String(s.reps)===String(g[0].reps)
+                                    && !!s.completed===!!g[0].completed);
+        (identical?dup:conflict).push({ workoutId:w.workoutId, date:w.date, name:w.name,
+          exercise:e.name, setNumber:Number(n), copies:g.length, reps:g[0].reps, weight:g[0].weight });
+      });
+    });
+  });
+  // A rep count far above your own norm for that movement — the symptom you'd notice.
+  allExerciseStats().forEach(m=>{
+    if(m.type==='weighted' || m.points.length<3) return;
+    const vals=m.points.map(p=>p.reps).filter(v=>v>0).sort((a,b)=>a-b);
+    if(vals.length<3) return;
+    const med=vals[Math.floor(vals.length/2)];
+    if(med<=0) return;
+    m.points.forEach(p=>{
+      if(p.reps>=2*med && p.reps>med+15)
+        outliers.push({ workoutId:p.id, date:p.date, exercise:m.name, reps:p.reps, median:med });
+    });
+  });
+  const res={ dup, conflict, stuck, outliers, total:dup.length+conflict.length+stuck.length+outliers.length };
+  _bestCache.__anom=res;
+  return res;
+}
+/* Group per workout+exercise so the report reads "sets 1,2,3 logged twice". */
+function dupGroups(list){
+  const g={};
+  list.forEach(d=>{
+    const k=d.workoutId+'|'+d.exercise;
+    if(!g[k]) g[k]=Object.assign({}, d, {sets:[]});
+    g[k].sets.push(d.setNumber);
+  });
+  return Object.values(g);
+}
+function openFinding(id){ closeModal(); editWorkout(id); }
+function findingRow(id, title, detail){
+  return `<button onclick="openFinding('${id}')" class="w-full chip rounded-xl p-3 text-left btn-press">
+    <div class="font-display font-600 text-sm truncate">${esc(title)}</div>
+    <div class="text-[11px] text-mute mt-0.5">${esc(detail)}</div>
+  </button>`;
+}
+function openDataCheck(){
+  const a=dataAnomalies();
+  const dg=dupGroups(a.dup), cg=dupGroups(a.conflict);
+  const block=(title,note,rows)=> rows.length ? `<p class="text-[11px] font-bold tracking-widest text-mute mt-4 mb-1.5">${title}</p>
+      <p class="text-[11px] text-mute mb-2 leading-snug">${note}</p>
+      <div class="space-y-2">${rows.join('')}</div>` : '';
+  const body = a.total===0
+    ? `<div class="chip rounded-xl p-4 text-center text-sm text-mute">No anomalies found. Every set is numbered the way it should be.</div>`
+    : block('DUPLICATED SETS',
+        'These sets were saved to your Sheet more than once, with identical numbers. They double that session&rsquo;s totals. Safe to remove.',
+        dg.map(d=>findingRow(d.workoutId, `${d.exercise} — ${fmtDateShort(d.date)}`,
+          `sets ${d.sets.sort((x,y)=>x-y).join(', ')} each logged ${d.copies}× · ${d.reps||0} reps`)))
+    + block('DUPLICATES THAT DISAGREE',
+        'Logged twice under the same set number but with different numbers — open these and check which one is right.',
+        cg.map(d=>findingRow(d.workoutId, `${d.exercise} — ${fmtDateShort(d.date)}`,
+          `set ${d.setNumber} has ${d.copies} conflicting versions`)))
+    + block('UNUSUALLY HIGH SESSIONS',
+        'Far above your normal for that movement. Often a knock-on effect of the duplicates above.',
+        a.outliers.map(o=>findingRow(o.workoutId, `${o.exercise} — ${fmtDateShort(o.date)}`,
+          `${o.reps} reps vs your usual ${o.median}`)))
+    + block('LEFT UNFINISHED',
+        'Started but never finished, so they never counted toward anything.',
+        a.stuck.map(o=>findingRow(o.workoutId, o.name, `${fmtDateShort(o.date)} · open for ${o.age} days`)));
+  modal(`<div class="p-5">
+    <h3 class="font-display font-700 text-xl">Data check</h3>
+    <p class="text-mute text-sm mt-1 leading-snug">Looks for records that came from a saving glitch rather than a real workout.</p>
+    <div class="mt-2 max-h-[52vh] overflow-y-auto">${body}</div>
+    <div class="grid ${dg.length?'grid-cols-2':'grid-cols-1'} gap-3 mt-5">
+      <button onclick="closeModal()" class="rounded-xl py-3 chip font-semibold btn-press">Close</button>
+      ${ dg.length ? `<button onclick="repairDuplicates()" class="rounded-xl py-3 font-bold text-ink btn-press" style="background:var(--volt)">Remove duplicates</button>`:'' }
+    </div>
+  </div>`);
+}
+/* Removes only EXACT duplicate copies (same set number, weight, reps and tick),
+   renumbers what is left, and re-saves those workouts to the Sheet. */
+function repairDuplicates(){
+  const a=dataAnomalies();
+  const ids=[...new Set(a.dup.map(d=>d.workoutId))];
+  if(!ids.length){ toast('Nothing to repair'); return; }
+  let removed=0;
+  ids.forEach(id=>{
+    const w=state.workouts.find(x=>x.workoutId===id); if(!w) return;
+    (w.exercises||[]).forEach(e=>{
+      const seen={}, keep=[];
+      (e.sets||[]).forEach(s=>{
+        const key=[s.setNumber, s.weight, s.reps, !!s.completed].join('|');
+        if(seen[key]){ removed++; return; }
+        seen[key]=1; keep.push(s);
+      });
+      e.sets=keep.map((s,i)=>Object.assign({}, s, {setNumber:i+1}));
+    });
+    w.updatedAt=Date.now();
+    queueSaveWorkout(w);
+  });
+  flushSaves(); clearBestCache(); closeModal(); render();
+  toast('Removed '+removed+' duplicate set'+(removed===1?'':'s'));
+}
+/* Shown on an exercise page whose records are implicated, because that is where
+   an impossible number actually gets noticed. */
+function exAnomalyBanner(name){
+  const k=(name||'').toLowerCase(), a=dataAnomalies();
+  const hit = a.dup.concat(a.conflict).filter(d=>d.exercise.toLowerCase()===k).length
+            + a.outliers.filter(d=>d.exercise.toLowerCase()===k).length;
+  if(!hit) return '';
+  return `<div class="px-5 mt-4">
+    <button onclick="openDataCheck()" class="w-full card p-3.5 text-left btn-press edge-ring flex items-center gap-3">
+      <svg class="w-5 h-5 shrink-0 edge-text" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>
+      <span class="min-w-0">
+        <span class="block font-display font-600 text-sm">${hit} record${hit===1?'':'s'} here may not be real</span>
+        <span class="block text-[11px] text-mute">Sets saved more than once inflate these totals. Tap to review.</span>
+      </span>
+    </button>
+  </div>`;
+}
+
+/* =================================================================
    SETTINGS
    ================================================================= */
+function _anomCount(){ try{ return dataAnomalies().total; }catch(e){ return 0; } }
 function openSettings(){
   modal(`<div class="p-5">
     <div class="flex items-center gap-3 mb-4">
@@ -2490,6 +2636,11 @@ function openSettings(){
       <span>Status</span>
       <span>${ state.gas ? '<b class="text-white">Connected (hosted)</b>' : (state.apiUrl ? (state.online?'<b class="text-white">Connected</b>':'<b class="edge-text">Not reachable</b>') : '<b>Device-only</b>') }</span>
     </div>
+
+    <button onclick="openDataCheck()" class="w-full flex items-center justify-between chip rounded-xl px-3 py-3 mb-3 btn-press">
+      <span class="text-sm font-semibold">Check my data</span>
+      <span class="text-[11px] font-bold ${_anomCount()?'edge-text':'text-mute'}">${_anomCount()? _anomCount()+' to review' : 'All clear'}</span>
+    </button>
 
     <div class="grid grid-cols-2 gap-3">
       <button onclick="closeModal()" class="rounded-xl py-3 chip font-semibold btn-press">Close</button>

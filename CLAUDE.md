@@ -73,6 +73,13 @@ copy is harmless but must never be used (it predates bug fixes).
   (`histListHtml`), Progress groups exercises by `muscleGroup()` and milestones
   by category; all use the shared `sectionHead()` accordion.
 
+- **Data check** (`dataAnomalies` / `repairDuplicates`, reachable from Settings and
+  from an implicated exercise page). `getData_L` pushes one set PER SHEET ROW with
+  no de-dup, so a row written twice returns as two sets sharing a `setNumber` —
+  real sets are always numbered 1..n, which makes a repeated setNumber a reliable
+  fingerprint for the July 2026 glitch. Identical copies can be auto-removed;
+  copies whose values disagree are only ever flagged, never guessed at.
+
 ## Hard-won gotchas — never reintroduce
 1. Google Sheets returns date cells as Date OBJECTS. Always normalize with
    `ymd()` on read; never `.localeCompare` a raw date.
