@@ -105,13 +105,15 @@ function getData_L(){
       weight: r.weight===''?'':String(r.weight),
       reps:   r.reps===''?'':String(r.reps),
       unit:   r.unit || 'kg',
-      completed: r.completed===true || String(r.completed).toUpperCase()==='TRUE'
+      completed: r.completed===true || String(r.completed).toUpperCase()==='TRUE',
+      _updatedAt: stamp_(r.updatedAt)
     });
   });
   const workouts = Object.keys(wmap).map(id => {
     const w = wmap[id]; delete w._exidx;
     w.exercises.sort((a,b)=>a.order-b.order);
-    w.exercises.forEach(ex => ex.sets.sort((a,b)=>a.setNumber-b.setNumber));
+    // Drop repeated setNumbers before the app sums reps. See dedupeSets_.
+    w.exercises.forEach(ex => { ex.sets = dedupeSets_(ex.sets); });
     return w;
   }).sort((a,b)=> String(b.date||'').localeCompare(String(a.date||'')) || (b.updatedAt||0)-(a.updatedAt||0));
 
@@ -130,6 +132,38 @@ function getData_L(){
   if (!settings.unit) settings.unit = 'lbs';
 
   return { ok:true, workouts:workouts, days:dmap, settings:settings };
+}
+
+/* July 2026 save race wrote the same setNumber more than once for one
+   workout. LockService now stops new races, but those old Sheet rows are
+   still there, and the app sums every completed set it is given. Keep one
+   row per setNumber — newest updatedAt, and the later row when the times
+   match. If weight/reps/completed disagree, still keep that one winner;
+   do not blend the copies. Then order by setNumber, so a duplicated 3×6
+   loads as three sets. */
+function dedupeSets_(sets){
+  const best = {};
+  (sets||[]).forEach(s => {
+    const prev = best[s.setNumber];
+    if (!prev || (s._updatedAt||0) >= (prev._updatedAt||0)) best[s.setNumber] = s;
+  });
+  return Object.keys(best).map(k => {
+    const s = best[k];
+    return {
+      setNumber: s.setNumber,
+      weight: s.weight,
+      reps: s.reps,
+      unit: s.unit,
+      completed: s.completed
+    };
+  }).sort((a,b) => a.setNumber - b.setNumber);
+}
+
+/* updatedAt is usually a number (Date.now()). Sheets may hand back a Date. */
+function stamp_(v){
+  if (v instanceof Date) return isNaN(v.getTime()) ? 0 : v.getTime();
+  const n = Number(v);
+  return isNaN(n) ? 0 : n;
 }
 
 /* ------------------------------ WRITE ------------------------------- */
