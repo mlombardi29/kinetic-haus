@@ -19,12 +19,14 @@
 <!--   2. Extensions > Apps Script, paste Code.gs, Deploy as Web   -->
 <!--      App (Execute as: Me, Who has access: Anyone).            -->
 <!--   3. Copy the Web App URL.                                    -->
-<!--   4. Open this app, tap the gear (top-right) and paste the    -->
-<!--      URL. Done. Data lives in your Sheet.                     -->
+<!--   4. Open this app, tap the gear (top-right). The owner's     -->
+<!--      URL is already filled in (DEFAULT_API_URL). Paste a      -->
+<!--      different one only if you deploy a new Web App.          -->
+<!--      Data lives in your Sheet.                                -->
 <!--                                                               -->
-<!--  Works offline / in sandboxes too: if no URL is set (or the   -->
-<!--  network/localStorage is blocked) the app keeps everything in -->
-<!--  memory + localStorage and never crashes.                     -->
+<!--  Works offline too: if the Sheet can't be reached, logging    -->
+<!--  still works. Workouts stay on the phone and are merged up    -->
+<!--  by workoutId the next time a sync succeeds.                  -->
 <!-- ============================================================= -->
 
 <script src="https://cdn.tailwindcss.com"></script>
@@ -497,7 +499,20 @@ function showNextCeleb(){
   </div>`);
 }
 function dismissCeleb(){ _celebQueue.shift(); closeModal(); if(_celebQueue.length) setTimeout(showNextCeleb,180); }
-function celebratePR(name, detail){ enqueueCeleb({ icon:'bolt', kind:'PERSONAL BEST', title:name, desc:detail+' — new best!' }); }
+function celebratePR(name, detail){
+  if(!celebrationsAllowed()) return;
+  enqueueCeleb({ icon:'bolt', kind:'PERSONAL BEST', title:name, desc:detail+' — new best!' });
+}
+/* Popups compare this session to history. That comparison is a lie when the
+   phone has an empty cache and the Sheet hasn't been read yet — it turns a
+   reconnect into a fake "first workout". Allow them once this session has
+   loaded the Sheet, or when a previous successful load left real history
+   on the phone (a gym with no signal). Never when the only data is empty. */
+function celebrationsAllowed(){
+  if(state.cloudLoaded) return true;
+  if(Store.get(KEY.cloudOk)==='1' && state.workouts.some(w=>w && w.status==='completed')) return true;
+  return false;
+}
 
 /* ---------- safe storage (never throws in sandboxes) ---------- */
 const Store = (() => {
@@ -512,9 +527,21 @@ const Store = (() => {
 })();
 
 /* ---------- global state ---------- */
-const KEY = { url:'kh_api_url', cache:'kh_cache', unit:'kh_unit', custom:'kh_custom_ex', seeded:'kh_seeded', tp:'kh_typeprefs', bw:'kh_bodyweight' };
+/* The owner's live Web App. If the phone forgets its saved settings, we use
+   this instead of silently dropping into Device-only mode. A different URL
+   typed in Settings still wins — we only fall back when the saved value is
+   missing or blank. The storage key has been `kh_api_url` since the first
+   version of the app; nothing here renames it. */
+const DEFAULT_API_URL = 'https://script.google.com/macros/s/AKfycbwvBoi1_7pp2cF_DR4FwGnb32wpWEuqKItHMkbXaDKhRCBvqRBvnZCJPK-ZomRMj_5_1g/exec';
+const KEY = { url:'kh_api_url', cache:'kh_cache', unit:'kh_unit', custom:'kh_custom_ex', seeded:'kh_seeded', tp:'kh_typeprefs', bw:'kh_bodyweight', cloudOk:'kh_cloud_ok' };
+function loadApiUrl(){
+  const stored=(Store.get(KEY.url)||'').trim();
+  if(stored) return stored;
+  Store.set(KEY.url, DEFAULT_API_URL);   // so Settings shows the real address, not a placeholder
+  return DEFAULT_API_URL;
+}
 const state = {
-  apiUrl: Store.get(KEY.url) || '',
+  apiUrl: loadApiUrl(),
   unit:   Store.get(KEY.unit) || 'lbs',
   bodyWeight: Store.get(KEY.bw) || '',   // powers work-scoring for bodyweight movements
   days:   {},        // name -> { name, exercises:[{name,sets,order}] }
@@ -528,6 +555,8 @@ const state = {
   gas:    false,     // true when the page is served from inside Apps Script
   loadFailed:false,  // cloud read failed on startup
   loadErr:'',
+  cloudLoaded:false, // true only after a successful Sheet read this session
+  unsyncedIds:[],    // workoutIds that are on the phone but failed to upload
 };
 
 /* ---------- tiny utils ---------- */
@@ -716,17 +745,57 @@ async function flushSaves(){
   if(!state.apiUrl && !state.gas){ setSaveFlag('local'); return; }   // device-only
   if(_flushing){ clearTimeout(saveTimer); saveTimer=setTimeout(flushSaves,250); return; }  // never overlap saves
   _flushing=true;
+  const failed=new Set();
   try{
-    while(saveQueue.size){                       // drain fully so late edits still get saved
-      const ids=[...saveQueue]; saveQueue.clear();
-      for(const id of ids){
-        const w = state.workouts.find(x=>x.workoutId===id);
-        if(w) await apiPost('saveWorkout', { workout:w });
+    // One workout at a time. Items queued while a save is in flight stay in
+    // the queue and are picked up by this loop. A failure is NOT retried here
+    // — the id goes back on the queue afterwards so it is never dropped.
+    while(saveQueue.size){
+      const id=saveQueue.values().next().value;
+      saveQueue.delete(id);
+      const w=state.workouts.find(x=>x.workoutId===id);
+      if(!w) continue;
+      try{
+        const res=await apiPost('saveWorkout', { workout:w });
+        if(!res || res.ok===false) throw new Error((res&&res.error)||'Could not save');
+        failed.delete(id);
+        state.unsyncedIds=(state.unsyncedIds||[]).filter(x=>x!==id);
+      }catch(e){
+        failed.add(id);
       }
     }
+  }finally{ _flushing=false; }
+  if(failed.size){
+    failed.forEach(id=>saveQueue.add(id));
+    state.unsyncedIds=[...new Set([...(state.unsyncedIds||[]), ...failed])];
+    setSaveFlag('local');
+    // Autosave while logging already shows "Saved on device". Only the
+    // reconnect/merge path asks for a visible warning — otherwise every
+    // set in a dead zone would toast.
+    if(state._uploadWarn) noteUnsynced(state.unsyncedIds.length);
+    else if(state.view!=='logger') render();
+  } else {
     setSaveFlag('saved');
-  }catch(e){ setSaveFlag('local'); }
-  finally{ _flushing=false; }
+    state._uploadWarn=false;
+    if(state._warnedUnsynced && !(state.unsyncedIds||[]).length){
+      state._warnedUnsynced=false;
+      if(state.view!=='logger') render();
+    }
+  }
+}
+function noteUnsynced(n){
+  state._uploadWarn=false;
+  state._warnedUnsynced=true;
+  const msg = n===1
+    ? '1 workout is only on this phone — still saved here'
+    : n+' workouts are only on this phone — still saved here';
+  toast(msg,'err',4500);
+  if(state.view!=='logger') render();
+}
+function retryUnsynced(){
+  (state.unsyncedIds||[]).forEach(id=>saveQueue.add(id));
+  state._uploadWarn=true;
+  flushSaves();
 }
 function setSaveFlag(s){
   const el=$('#saveFlag'); if(!el) return;
@@ -737,39 +806,47 @@ function setSaveFlag(s){
 }
 
 /* ---------- toast ---------- */
-function toast(msg, kind='ok'){
+function toast(msg, kind='ok', ms=1900){
   const root=$('#toast');
   const color = kind==='err' ? 'border-red-500/50 text-red-300' : 'border-volt/40 accent-text';
   const el=document.createElement('div');
   el.className=`toast-in glass ${color} border px-4 py-2.5 rounded-full text-sm font-semibold mb-2 shadow-xl`;
   el.textContent=msg;
   root.appendChild(el);
-  setTimeout(()=>{ el.style.transition='opacity .3s'; el.style.opacity='0'; setTimeout(()=>el.remove(),300); }, 1900);
+  setTimeout(()=>{ el.style.transition='opacity .3s'; el.style.opacity='0'; setTimeout(()=>el.remove(),300); }, ms);
 }
 
 /* =================================================================
    BOOT
    ================================================================= */
+function askToKeepData(){
+  // Ask the browser not to evict this site's saved settings and workout cache.
+  // It can still say no; the baked-in Sheet URL is the real safety net.
+  try{ if(navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(()=>{}); }catch(e){}
+}
 async function boot(){
   cacheLoad();
   bindNav();
   bindDelegation();
+  askToKeepData();
   // flush any pending save the moment the screen sleeps / app backgrounds
   document.addEventListener('visibilitychange',()=>{ if(document.hidden) flushSaves(); });
   window.addEventListener('pagehide',()=>{ flushSaves(); });
   state.loading=true;
-  render();              // paint from cache instantly (shows "Reconnecting…" if empty)
+  render();              // paint from cache instantly (shows "Syncing…" if empty)
   state.gas = await waitForGAS();   // wait for Apps Script bridge before deciding we're offline
+  if(!state.apiUrl && !state.gas) state.apiUrl=loadApiUrl();
   if(state.apiUrl || state.gas){
     const res = await apiGetRetry(4);
     state.loading=false;
-    if(res.ok){
+    if(res.ok && res.data && res.data.ok){
       applyCloud(res.data);
       state.loadFailed=false;
       // brand-new empty sheet → seed the 4 default days once (and push them)
       if(!state.workouts.length && !Object.keys(state.days).length && !Store.get(KEY.seeded)) seedExampleDays(true);
     } else {
       state.loadFailed=true;
+      state.online=false;
       state.loadErr = res.err ? String(res.err && res.err.message || res.err) : 'Could not reach the Sheet';
     }
     render();
@@ -804,35 +881,75 @@ async function apiGetRetry(tries=4){
 async function retryConnect(){
   state.loading=true; state.loadFailed=false; render();
   state.gas = await waitForGAS();
+  if(!state.apiUrl && !state.gas) state.apiUrl=loadApiUrl();
   const res = await apiGetRetry(4);
   state.loading=false;
-  if(res.ok){ applyCloud(res.data); state.loadFailed=false; }
-  else { state.loadFailed=true; state.loadErr = res.err ? String(res.err && res.err.message || res.err) : 'Could not reach the Sheet'; }
+  if(res.ok && res.data && res.data.ok){ applyCloud(res.data); state.loadFailed=false; }
+  else {
+    state.loadFailed=true;
+    state.online=false;
+    state.loadErr = res.err ? String(res.err && res.err.message || res.err) : 'Could not reach the Sheet';
+  }
   render();
 }
 function pushAllDays(){
   if(!(state.apiUrl||state.gas)) return;
   Object.values(state.days).forEach(d=>{ apiPost('saveDay',{ day:d, oldName:'' }).catch(()=>{}); });
 }
-function pushAllWorkouts(){
-  if(!(state.apiUrl||state.gas)) return;
-  state.workouts.forEach(w=>{ apiPost('saveWorkout',{ workout:w }).catch(()=>{}); });
-}
 /* Merge a cloud snapshot WITHOUT ever destroying local data:
    if the cloud comes back empty (slow/failed write, fresh tab) we keep what we
-   have and re-push it, so toggling units / re-syncing can never wipe your days. */
+   have and re-push it, so toggling units / re-syncing can never wipe your days.
+   Workouts are matched by workoutId. A workout that exists only on the phone,
+   or a newer copy of one the Sheet already has, is kept and uploaded.
+   The Sheet copy wins when it is the same age or newer. */
+function mergeWorkouts(localList, cloudList){
+  const local=new Map();
+  (localList||[]).forEach(w=>{ if(w && w.workoutId) local.set(String(w.workoutId), w); });
+  const cloud=new Map();
+  (cloudList||[]).forEach(w=>{ if(w && w.workoutId) cloud.set(String(w.workoutId), w); });
+  const merged=[], upload=[], seen=new Set();
+  cloud.forEach((cw,id)=>{
+    seen.add(id);
+    const lw=local.get(id);
+    if(lw && num(lw.updatedAt)>num(cw.updatedAt)){ merged.push(lw); upload.push(lw); }
+    else merged.push(cw);
+  });
+  local.forEach((lw,id)=>{
+    if(seen.has(id)) return;
+    merged.push(lw);
+    upload.push(lw);
+  });
+  (localList||[]).forEach(w=>{
+    if(!w || w.workoutId) return;
+    w.workoutId=uid();
+    merged.push(w);
+    upload.push(w);
+  });
+  return { merged:merged.sort(sortWorkouts), upload };
+}
 function applyCloud(data, pullUnit=true){
   if(!data || !data.ok) return;
-  state.online=true; clearBestCache();
+  state.online=true;
+  state.cloudLoaded=true;
+  state.loadFailed=false;
+  Store.set(KEY.cloudOk,'1');
+  clearBestCache();
   const cDays=data.days||{}, cW=data.workouts||[];
   if(Object.keys(cDays).length){ state.days=cDays; }
   else if(Object.keys(state.days).length){ pushAllDays(); }   // cloud empty, we have local -> restore upward
-  if(cW.length){ state.workouts=cW.sort(sortWorkouts); }
-  else if(state.workouts.length){ pushAllWorkouts(); }        // cloud empty, we have local -> restore upward
+  const merged=mergeWorkouts(state.workouts, cW);
+  state.workouts=merged.merged;
   if(pullUnit && data.settings && data.settings.unit){ state.unit=data.settings.unit; Store.set(KEY.unit,state.unit); }
   if(data.settings && data.settings.typePrefs){ try{ state.typePrefs=JSON.parse(data.settings.typePrefs)||{}; Store.set(KEY.tp,JSON.stringify(state.typePrefs)); }catch(e){} }
   if(data.settings && num(data.settings.bodyWeight)>0){ state.bodyWeight=String(num(data.settings.bodyWeight)); Store.set(KEY.bw,state.bodyWeight); }
+  // Cache the merged list BEFORE uploading, so a failed upload cannot drop
+  // a phone-only workout the way a straight replace used to.
   cacheSave();
+  if(merged.upload.length){
+    merged.upload.forEach(w=>{ if(w && w.workoutId) saveQueue.add(w.workoutId); });
+    state._uploadWarn=true;
+    flushSaves();
+  }
 }
 function sortWorkouts(a,b){
   const ip = (a.status==='in_progress')?1:0, ip2=(b.status==='in_progress')?1:0;
@@ -963,17 +1080,52 @@ function brandBar(){
 function viewReconnect(){
   const loading=state.loading;
   return `${brandBar()}
-  <div class="px-6 pt-24 text-center">
+  <div class="px-6 pt-20 text-center">
     <div class="mx-auto w-16 h-16 rounded-2xl chip flex items-center justify-center mb-5 text-white">
       ${ loading
         ? `<svg class="w-8 h-8 spin" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" d="M12 3a9 9 0 1 0 9 9"/></svg>`
         : `<svg class="w-8 h-8 text-mute" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 12a9 9 0 0 1 15-6.7L21 8M21 3v5h-5M21 12a9 9 0 0 1-15 6.7L3 16M3 21v-5h5"/></svg>` }
     </div>
-    <h1 class="font-display font-700 text-2xl">${ loading ? 'Reconnecting…' : 'Can’t reach your Sheet' }</h1>
-    <p class="text-mute text-sm mt-2 leading-snug">Your data is safe in Google Sheets — this is just a connection hiccup. ${loading?'Hang tight.':'Tap retry.'}</p>
-    ${ (!loading && state.loadErr) ? `<p class="text-[11px] text-mute/70 mt-3 break-words">${esc(state.loadErr)}</p>` : '' }
-    ${ !loading ? `<button onclick="retryConnect()" class="mt-6 w-full rounded-2xl py-4 font-display font-700 text-lg tracking-wide text-ink btn-press" style="background:var(--volt)">RETRY</button>
-       <button onclick="openSettings()" class="mt-3 text-xs font-semibold text-mute btn-press py-2">Open settings</button>` : '' }
+    <h1 class="font-display font-700 text-2xl">${ loading ? 'Syncing your Sheet…' : 'Offline — not synced' }</h1>
+    <p class="text-mute text-sm mt-2 leading-snug">${ loading
+      ? 'Loading your history. Everything stays in the Sheet either way.'
+      : 'This phone can’t reach your Sheet right now. Nothing was deleted — your workouts are still there, and they’ll show up here once you’re back online. You can still log a workout.' }</p>
+    ${ !loading ? `<button onclick="retryConnect()" class="mt-6 w-full rounded-2xl py-4 font-display font-700 text-lg tracking-wide text-ink btn-press" style="background:var(--volt)">Try again</button>
+       <button onclick="openSettings()" class="mt-3 text-xs font-semibold text-mute btn-press py-2">Settings</button>` : '' }
+  </div>`;
+}
+/* Calm notice when the Sheet hasn't confirmed the list on screen.
+   Shown on Home, History and Progress — not instead of a workout in progress. */
+function syncBanner(){
+  const n=(state.unsyncedIds||[]).length;
+  const hasCloud=!!(state.apiUrl||state.gas);
+  const showLoading=hasCloud && state.loading && !state.cloudLoaded;
+  const showOffline=hasCloud && !state.online && !state.loading;
+  if(!showLoading && !showOffline && !n) return '';
+  let title, body, btn='';
+  if(n && !state.loading){
+    title = n===1 ? '1 workout is only on this phone' : n+' workouts are only on this phone';
+    body = 'Saved here, not deleted. It hasn’t reached the Sheet yet. The rest of your history is still in the Sheet.';
+    if(n>1) body = 'Saved here, not deleted. They haven’t reached the Sheet yet. The rest of your history is still in the Sheet.';
+    btn = state.online
+      ? `<button onclick="retryUnsynced()" class="mt-2 text-xs font-semibold text-white btn-press">Try uploading again</button>`
+      : `<button onclick="retryConnect()" class="mt-2 text-xs font-semibold text-white btn-press">Try again</button>`;
+  } else if(showLoading){
+    title = 'Syncing with your Sheet';
+    body = 'Your history will show up as soon as it loads.';
+  } else {
+    title = 'Offline — not synced';
+    body = state.workouts.length
+      ? 'Showing workouts saved on this phone. Your Sheet couldn’t be reached, so anything newer there isn’t in this list yet.'
+      : 'Your workouts are still in the Sheet. This phone can’t reach it right now, so history isn’t on the screen yet.';
+    btn = `<button onclick="retryConnect()" class="mt-2 text-xs font-semibold text-white btn-press">Try again</button>`;
+  }
+  return `<div class="px-5 mt-4">
+    <div class="rounded-2xl border border-line bg-panel px-4 py-3 text-left">
+      <div class="text-sm font-semibold text-white">${title}</div>
+      <p class="text-[12px] text-mute mt-1 leading-snug">${body}</p>
+      ${btn}
+    </div>
   </div>`;
 }
 
@@ -992,6 +1144,8 @@ function viewHome(){
     <p class="text-mute text-sm font-medium">${greeting()}</p>
     <h1 class="font-display font-700 text-3xl mt-1 tracking-tight">Ready to <span class="accent-text">move</span>.</h1>
   </div>
+
+  ${syncBanner()}
 
   ${ ip ? resumeCard(ip) : '' }
 
@@ -1020,7 +1174,9 @@ function viewHome(){
   </div>
   <div class="px-5 mt-3 space-y-3">
     ${ recents.length ? recents.map(recentCard).join('') :
-      `<div class="card p-5 text-center text-mute text-sm">Your finished workouts will appear here.</div>` }
+      (state.cloudLoaded
+        ? `<div class="card p-5 text-center text-mute text-sm">Your finished workouts will appear here.</div>`
+        : `<div class="card p-5 text-center text-mute text-sm">History hasn’t loaded from the Sheet yet. Nothing was deleted.</div>`) }
   </div>
   `;
 }
@@ -1053,7 +1209,7 @@ function recentCard(w){
     <div class="flex items-start justify-between gap-3">
       <div class="min-w-0">
         <h3 class="font-display font-600 text-lg truncate">${esc(w.name)}</h3>
-        <p class="text-mute text-xs mt-0.5">${fmtDate(w.date)}</p>
+        <p class="text-mute text-xs mt-0.5">${fmtDate(w.date)}${onPhoneOnly(w)?' · on this phone only':''}</p>
       </div>
       <button onclick="editWorkout('${w.workoutId}')" class="chip btn-press text-xs font-semibold px-3 py-2 rounded-lg shrink-0">EDIT</button>
     </div>
@@ -1168,6 +1324,9 @@ function dayCmpHtml(w){
   const b=dayBest(w.name, w.workoutId);
   const work=workoutWork(w), reps=workoutReps(w), hold=workoutHold(w);
   if(!b.count){
+    if(!celebrationsAllowed()){
+      return `<div class="text-[10px] text-mute text-center">Your records will show once the Sheet has loaded.</div>`;
+    }
     return `<div class="text-[10px] text-mute text-center">First <b class="text-white">${esc(w.name)}</b> — today sets the benchmark.</div>`;
   }
   const pct=b.work>0 ? Math.min(100, Math.round(100*work/b.work)) : 0;
@@ -1326,6 +1485,7 @@ function toggleSet(i,j){
   refreshSets(i); refreshExBest(i); refreshStats(); touch();
 }
 function checkPR(i,j,type){
+  if(!celebrationsAllowed()) return;
   const w=state.active; const e=w.exercises[i]; const s=e.sets[j];
   const best=exerciseBest(e.name, w.workoutId);
   w._prShown = w._prShown || {};
@@ -1524,14 +1684,18 @@ function sessionPRCelebs(w){
 }
 function doFinish(){
   const w=state.active;
-  const beforeIds=computeBadges().filter(b=>b.earned).map(b=>b.id);  // before this one counts
-  const prs=sessionPRCelebs(w);                                      // measured before it counts too
+  // Decide before this workout counts, and before it can look like a first
+  // workout just because the Sheet hasn't loaded.
+  const allow=celebrationsAllowed();
+  const beforeIds=allow ? computeBadges().filter(b=>b.earned).map(b=>b.id) : [];
+  const prs=allow ? sessionPRCelebs(w) : [];
   w.status='completed'; w.updatedAt=Date.now();
   queueSaveWorkout(w); flushSaves();
   state.workouts.sort(sortWorkouts);
-  const fresh=computeBadges().filter(b=>b.earned && !beforeIds.includes(b.id));
   state.active=null; closeModal();
   go('home');
+  if(!allow){ toast('Workout saved on this phone'); return; }
+  const fresh=computeBadges().filter(b=>b.earned && !beforeIds.includes(b.id));
   // queue AFTER the view swap — go() would otherwise tear down the first popup.
   // Records come first, then milestones; a huge session is capped at 5 popups so
   // finishing never turns into a tapping exercise.
@@ -1714,7 +1878,12 @@ function histFiltered(){
 }
 function histListHtml(){
   const list=histFiltered();
-  if(!list.length) return `<div class="card p-6 text-center text-mute text-sm">No workouts found.</div>`;
+  if(!list.length){
+    if(!state.cloudLoaded && !state.workouts.length){
+      return `<div class="card p-6 text-center text-mute text-sm">Nothing loaded yet. Your workouts are still in the Sheet — this phone just isn’t synced.</div>`;
+    }
+    return `<div class="card p-6 text-center text-mute text-sm">No workouts found.</div>`;
+  }
   const searching=!!_histQ.trim();
   const months={}, order=[];
   list.forEach(w=>{
@@ -1749,6 +1918,7 @@ function viewHistory(){
       <input value="${esc(_histQ)}" oninput="_histQ=this.value;updateHistoryList()" placeholder="Search workouts or exercises" class="bg-transparent py-3 w-full outline-none text-base placeholder:text-mute"/>
     </div>
   </div>
+  ${syncBanner()}
   ${ chips.length>1 ? `<div class="mt-3 px-5 flex gap-2 overflow-x-auto pb-1">
       ${chip('All','',!_histDay)}
       ${chips.map(n=>chip(n,n.toLowerCase(),_histDay===n.toLowerCase())).join('')}
@@ -1764,7 +1934,10 @@ function historyCard(w){
   return `<button onclick="editWorkout('${w.workoutId}')" class="btn-press w-full chip rounded-xl p-3 text-left">
     <div class="flex items-center justify-between gap-2">
       <h3 class="font-display font-700 text-base truncate">${esc(w.name)}</h3>
-      ${ ip ? `<span class="text-[10px] font-bold tracking-widest accent-text shrink-0">● LIVE</span>` : `<span class="text-mute text-xs shrink-0">${fmtDateShort(w.date)}</span>` }
+      <span class="shrink-0 text-right">
+        ${ ip ? `<span class="text-[10px] font-bold tracking-widest accent-text">● LIVE</span>` : `<span class="text-mute text-xs">${fmtDateShort(w.date)}</span>` }
+        ${ onPhoneOnly(w) ? `<span class="block text-[10px] font-bold tracking-widest text-mute mt-0.5">ON THIS PHONE</span>` : '' }
+      </span>
     </div>
     <div class="flex flex-wrap gap-x-3 gap-y-1 mt-1.5 text-xs">
       <span class="text-mute"><b class="text-white font-display">${(w.exercises||[]).length}</b> ex</span>
@@ -2052,7 +2225,10 @@ function computeBadges(src){
    only surface what you have already earned plus the next two rungs, so the grid
    never becomes the wall of locked tiles an endless ladder would otherwise be. */
 function badgeCategories(src){
-  const all=computeBadges(src);
+  // Until the Sheet has been read, don't paint milestones as unlocked. An empty
+  // phone would otherwise show "First Rep" for a workout logged before sync.
+  let all=computeBadges(src);
+  if(!celebrationsAllowed()) all=all.map(b=>Object.assign({}, b, {earned:false}));
   const byCat={};
   all.forEach(b=>{ (byCat[b.cat=b.cat||'Milestones']=byCat[b.cat]||[]).push(b); });
   return CAT_ORDER.filter(c=>byCat[c]).map(c=>{
@@ -2156,6 +2332,7 @@ function viewProgress(){
 
   return `
   ${brandBar()}
+  ${syncBanner()}
   <div class="px-5 mt-4 flex items-center justify-between">
     <h1 class="font-display font-700 text-2xl">Progress</h1>
     <div class="flex chip rounded-xl p-1 gap-1">
@@ -2190,6 +2367,7 @@ function viewProgress(){
     <h2 class="font-display font-600 text-sm tracking-[.15em] text-mute">MILESTONES</h2>
     <span class="text-xs font-bold edge-text">${earned}/${totalB}</span>
   </div>
+  ${ celebrationsAllowed() ? '' : `<p class="px-5 mt-2 text-[12px] text-mute leading-snug">Personal bests and milestones wait until the Sheet has loaded, so a phone with no history yet doesn’t count as day one.</p>` }
   <div id="badgeAccordion" class="px-5 mt-3 space-y-2.5">${badgeAccordionHtml()}</div>
 
   <!-- Consistency -->
@@ -2620,7 +2798,7 @@ function openSettings(){
       ? `<div class="rounded-xl chip p-3 mb-3 text-sm"><b class="text-white">Hosted in Google.</b> <span class="text-mute">This app is served from your Apps Script and syncs to your Sheet automatically — no URL needed.</span></div>`
       : `<label class="text-xs font-bold tracking-widest text-mute">GOOGLE APPS SCRIPT URL</label>
          <input id="setUrl" value="${esc(state.apiUrl)}" placeholder="https://script.google.com/macros/s/.../exec" class="field w-full p-3 text-sm mt-1.5 mb-1"/>
-         <p class="text-[11px] text-mute mb-3">Paste your deployed Web App URL to sync with Google Sheets. Leave blank to use this device only.</p>` }
+         <p class="text-[11px] text-mute mb-3">Filled in for you, so a phone that forgets its settings still finds your Sheet. Paste a different address only if you deploy a new Web App. Clearing this box puts the usual address back.</p>` }
 
     <label class="text-xs font-bold tracking-widest text-mute">UNITS</label>
     <div class="grid grid-cols-2 gap-2 mt-1.5 mb-4">
@@ -2659,7 +2837,11 @@ function setUnit(u){
 }
 async function saveSettings(){
   const el=$('#setUrl');
-  if(el){ state.apiUrl=el.value.trim(); Store.set(KEY.url,state.apiUrl); }
+  if(el){
+    const typed=el.value.trim();
+    state.apiUrl = typed || DEFAULT_API_URL;   // a cleared box falls back to the built-in address
+    Store.set(KEY.url, state.apiUrl);
+  }
   const bw=$('#setBw');
   if(bw){ const v=num(bw.value); state.bodyWeight = v>0 ? String(v) : ''; Store.set(KEY.bw, state.bodyWeight); }
   cacheSave();
@@ -2670,13 +2852,21 @@ async function saveSettings(){
   }
 }
 async function reloadFromCloud(silent){
+  if(!state.apiUrl && !state.gas) state.apiUrl=loadApiUrl();
   if(!state.apiUrl && !state.gas){ if(!silent) toast('No URL set','err'); return; }
   try{
     const data=await apiGet();
+    if(!data || !data.ok) throw new Error((data&&data.error)||'Could not reach cloud');
     applyCloud(data);
     render(); if(!silent) toast('Synced');
-  }catch(e){ state.online=false; if(!silent) toast('Could not reach cloud','err'); render(); }
+  }catch(e){
+    state.online=false;
+    state.loadFailed=true;
+    if(!silent) toast('Could not reach cloud','err');
+    render();
+  }
 }
+function onPhoneOnly(w){ return !!(w && (state.unsyncedIds||[]).indexOf(w.workoutId)>=0); }
 
 /* ---------- go ---------- */
 boot();
